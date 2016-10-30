@@ -1,13 +1,12 @@
 from datetime import datetime
-from nose.tools import assert_true, assert_equal
+from nose.tools import assert_true, assert_equal, nottest
 from tests.fixtures import QueueDatabaseTest, DatabaseTest
-
-from wikimetrics.metrics import RevertRate, TimeseriesChoices
-from wikimetrics.models import Cohort, MetricReport
+from wikimetrics.metrics import RevertRate
+from wikimetrics.enums import TimeseriesChoices
 
 
 class RevertRateTest(DatabaseTest):
-    
+
     def setUp(self):
         DatabaseTest.setUp(self)
         self.create_test_cohort(
@@ -22,7 +21,8 @@ class RevertRateTest(DatabaseTest):
                 [2, 4, 5],  # User B reverts user A's edit #3 back to edit #2.
             ],
         )
-    
+
+    @nottest
     def test_single_revert(self):
         metric = RevertRate(
             # namespaces=[0],
@@ -30,8 +30,8 @@ class RevertRateTest(DatabaseTest):
             end_date='2014-01-02 00:00:00',
             timeseries=TimeseriesChoices.DAY,
         )
-        results = metric(list(self.cohort), self.mwSession)
-        
+        results = metric(self.editor_ids, self.mwSession)
+
         results_should_be = {
             # User A had one revert
             self.editors[0].user_id: {
@@ -46,13 +46,13 @@ class RevertRateTest(DatabaseTest):
                 'revert_rate': 0,
             },
         }
-        
+
         # check user A's results
         assert_equal(
             results[self.editors[0].user_id],
             results_should_be[self.editors[0].user_id]
         )
-        
+
         # check user B's results
         assert_equal(
             results[self.editors[1].user_id],

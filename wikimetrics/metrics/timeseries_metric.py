@@ -6,19 +6,10 @@ from wtforms import SelectField
 
 from wikimetrics.models import Revision
 from wikimetrics.utils import thirty_days_ago, today, format_pretty_date
+from wikimetrics.enums import TimeseriesChoices
+from wikimetrics.forms.fields import CommaSeparatedIntegerListField, BetterDateTimeField
+from wikimetrics.forms.validators import NotGreater
 from metric import Metric
-from form_fields import CommaSeparatedIntegerListField, BetterDateTimeField
-
-
-__all__ = ['TimeseriesChoices', 'TimeseriesMetric']
-
-
-class TimeseriesChoices(object):
-    NONE = 'none'
-    HOUR = 'hour'
-    DAY = 'day'
-    MONTH = 'month'
-    YEAR = 'year'
 
 
 class TimeseriesMetric(Metric):
@@ -28,7 +19,8 @@ class TimeseriesMetric(Metric):
     output.
     """
     
-    start_date  = BetterDateTimeField(default=thirty_days_ago)
+    start_date  = BetterDateTimeField(
+        default=thirty_days_ago, validators=[NotGreater('end_date')])
     end_date    = BetterDateTimeField(default=today)
     timeseries  = SelectField(
         'Time Series by',
@@ -40,16 +32,17 @@ class TimeseriesMetric(Metric):
             (TimeseriesChoices.MONTH, TimeseriesChoices.MONTH),
             (TimeseriesChoices.YEAR, TimeseriesChoices.YEAR),
         ],
+        description='Report results by year, month, day, or hour',
     )
     
-    def apply_timeseries(self, query, rev=Revision):
+    def apply_timeseries(self, query, column=Revision.rev_timestamp):
         """
         Take a query and slice it up into equal time intervals
         
         Parameters
             query   : a sql alchemy query
-            rev     : defaults to Revision, specifies the object that
-                      contains the appropriate rev_timestamp
+            column  : defaults to Revision.rev_timestamp, specifies the timestamp
+                      column to use for the timeseries
         
         Returns
             The query parameter passed in, with a grouping by the desired time slice
@@ -59,26 +52,26 @@ class TimeseriesMetric(Metric):
         if choice == TimeseriesChoices.NONE:
             return query
         
-        query = query.add_column(func.year(rev.rev_timestamp))
-        query = query.group_by(func.year(rev.rev_timestamp))
+        query = query.add_column(func.year(column))
+        query = query.group_by(func.year(column))
         
         if choice == TimeseriesChoices.YEAR:
             return query
         
-        query = query.add_column(func.month(rev.rev_timestamp))
-        query = query.group_by(func.month(rev.rev_timestamp))
+        query = query.add_column(func.month(column))
+        query = query.group_by(func.month(column))
         
         if choice == TimeseriesChoices.MONTH:
             return query
         
-        query = query.add_column(func.day(rev.rev_timestamp))
-        query = query.group_by(func.day(rev.rev_timestamp))
+        query = query.add_column(func.day(column))
+        query = query.group_by(func.day(column))
         
         if choice == TimeseriesChoices.DAY:
             return query
         
-        query = query.add_column(func.hour(rev.rev_timestamp))
-        query = query.group_by(func.hour(rev.rev_timestamp))
+        query = query.add_column(func.hour(column))
+        query = query.group_by(func.hour(column))
         
         if choice == TimeseriesChoices.HOUR:
             return query
@@ -114,6 +107,13 @@ class TimeseriesMetric(Metric):
         # get a dictionary of user_ids to their metric results
         results = self.submetrics_by_user(query, submetrics, date_index)
         
+        # default user_ids to all the user ids in the results, if not present
+        if user_ids and len(user_ids):
+            if len(results.keys()) > len(user_ids):
+                raise Exception('Filtering did not work properly')
+        else:
+            user_ids = results.keys()
+
         # make a default return dictionary for users not found by the query
         submetric_defaults = dict()
         for label, index, default in submetrics:
@@ -147,7 +147,7 @@ class TimeseriesMetric(Metric):
         # get results by user and by date
         for row in query_results:
             user_id = row[0]
-            if not user_id in results:
+            if user_id not in results:
                 results[user_id] = OrderedDict()
             
             date_slice = None
@@ -156,7 +156,7 @@ class TimeseriesMetric(Metric):
             
             for label, index, default in submetrics:
                 if date_slice:
-                    if not label in results[user_id]:
+                    if label not in results[user_id]:
                         results[user_id][label] = dict()
                     results[user_id][label][date_slice] = row[index]
                 else:
@@ -196,7 +196,7 @@ class TimeseriesMetric(Metric):
         
         for user_id, user_submetrics in results_by_user.iteritems():
             for label, i, default in submetrics:
-                if not label or not user_submetrics or not label in user_submetrics:
+                if not label or not user_submetrics or label not in user_submetrics:
                     continue
                 defaults = timeseries_slices.copy()
                 defaults.update(user_submetrics[label])

@@ -1,7 +1,12 @@
 SQL_ECHO                        : False
-#WIKIMETRICS_ENGINE_URL          : 'sqlite:///test.db'
-#MEDIAWIKI_ENGINE_URL_TEMPLATE   : 'sqlite:///{0}.db'
 # For testing with mysql locally (useful for manual connection survival tests)
 WIKIMETRICS_ENGINE_URL          : 'mysql://wikimetrics:wikimetrics@localhost/wikimetrics'
+WIKIMETRICS_POOL_SIZE           : 20
 MEDIAWIKI_ENGINE_URL_TEMPLATE   : 'mysql://wikimetrics:wikimetrics@localhost/{0}'
+MEDIAWIKI_POOL_SIZE             : 32
+CENTRALAUTH_ENGINE_URL          : 'mysql://wikimetrics:wikimetrics@localhost/centralauth'
 DEBUG                           : True
+REVISION_TABLENAME              : 'revision_userindex'
+ARCHIVE_TABLENAME               : 'archive_userindex'
+REPLICATION_LAG_MW_PROJECTS     : [] # empty, so inactive test wikis don't block us
+REPLICATION_LAG_THRESHOLD       : 3 # (measured in hours)

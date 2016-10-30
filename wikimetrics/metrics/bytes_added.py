@@ -1,19 +1,15 @@
-from ..utils import thirty_days_ago, today
-from ..models import Revision, Page
-from timeseries_metric import TimeseriesMetric
-from form_fields import (
+from sqlalchemy import func, case, cast, Integer
+from sqlalchemy.sql.expression import label
+from wtforms.validators import Required
+
+from wikimetrics.utils import thirty_days_ago, today
+from wikimetrics.models import Revision, Page
+from wikimetrics.forms.fields import (
     BetterDateTimeField,
     BetterBooleanField,
     CommaSeparatedIntegerListField,
 )
-from wtforms.validators import Required
-from sqlalchemy import func, case, cast, Integer
-from sqlalchemy.sql.expression import label
-
-
-__all__ = [
-    'BytesAdded',
-]
+from timeseries_metric import TimeseriesMetric
 
 
 class BytesAdded(TimeseriesMetric):
@@ -60,11 +56,15 @@ class BytesAdded(TimeseriesMetric):
             ) AS anon_1
       GROUP BY anon_1.rev_user
     """
-    show_in_ui  = True
-    id          = 'bytes-added'
-    label       = 'Bytes Added'
-    description = 'Compute different aggregations of the bytes\
-                   contributed or removed from a mediawiki project'
+    show_in_ui          = True
+    id                  = 'bytes-added'
+    label               = 'Bytes Added'
+    category            = 'Content'
+    default_submetric   = 'net_sum'
+    description     = 'Compute different aggregations of the bytes\
+                       contributed or removed from a mediawiki project'
+    # filled in below as the default depends on options
+    default_result  = {}
     
     namespaces          = CommaSeparatedIntegerListField(
         None,
@@ -94,7 +94,7 @@ class BytesAdded(TimeseriesMetric):
         end_date = self.end_date.data
         
         PreviousRevision = session.query(Revision.rev_len, Revision.rev_id).subquery()
-        BC = session.query(
+        query = session.query(
             Revision.rev_user,
             Revision.rev_timestamp,
             label(
@@ -107,13 +107,13 @@ class BytesAdded(TimeseriesMetric):
             .join(Page)\
             .outerjoin(
                 PreviousRevision,
-                Revision.rev_parent_id == PreviousRevision.c.rev_id
-            )\
+                Revision.rev_parent_id == PreviousRevision.c.rev_id)\
             .filter(Page.page_namespace.in_(self.namespaces.data))\
-            .filter(Revision.rev_user.in_(user_ids))\
             .filter(Revision.rev_timestamp > start_date)\
-            .filter(Revision.rev_timestamp <= end_date)\
-            .subquery()
+            .filter(Revision.rev_timestamp <= end_date)
+
+        query = self.filter(query, user_ids)
+        BC = query.subquery()
         
         bytes_added_by_user = session.query(BC.c.rev_user).group_by(BC.c.rev_user)
         
@@ -151,6 +151,8 @@ class BytesAdded(TimeseriesMetric):
                 )).label('negative_only_sum'),
             )
             index += 1
-        
-        query = self.apply_timeseries(bytes_added_by_user, rev=BC.c)
+
+        self.default_result = {s[0]: s[2] for s in submetrics}
+
+        query = self.apply_timeseries(bytes_added_by_user, column=BC.c.rev_timestamp)
         return self.results_by_user(user_ids, query, submetrics, date_index=index)

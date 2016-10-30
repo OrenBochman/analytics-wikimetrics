@@ -1,0 +1,541 @@
+#!/usr/bin/env python
+import argparse
+import sys
+import requests
+import re
+import json
+import traceback
+from datetime import datetime
+
+
+WIKIMETRICS_BOT_NAME = 'WikimetricsBot'
+PROJECT_FILE = re.compile(r'^(.*)\.json')
+
+
+def get_public_wikis():
+    """
+    Gets a set of all wikis not marked private
+    NOTE: wikis like wikimania2015wiki and **wikimedia will still show up
+    """
+    public_wikis = get_wikis_we_care_about().get('reverse', {})
+    return set(public_wikis.keys())
+
+
+def description(name, length):
+    return '{} {}{}'.format(length, name, 's' * min(length - 1, 1)),
+
+
+def get_wikis_we_care_about(limit_to=None):
+    """
+    Queries site matrix and filters all wikis that aren't private
+    Also manually adds any aggregations that are known to exist
+
+    Parameters
+        limit_to  : limit output to wikis found in this set (default all wikis)
+
+    Returns
+        A nested dictionary of this shape: {
+            "languages": [
+                {
+                    "shortName": "rn",
+                    "name": "Rundi",
+                    "projects": {
+                        "wiki": "rnwiki",
+                        "wiktionary": "rnwiktionary"
+                    },
+                    "description": [
+                        "2 projects"
+                    ]
+                },
+                ...
+            ],
+            "projects": [
+                {
+                    "languages": {
+                        "All Languages": "incubatorwiki"
+                    },
+                    "count": 1,
+                    "name": "incubator",
+                    "description": [
+                        "1 language"
+                    ]
+                },
+                ...
+            ],
+            "reverse": {
+                "cawikibooks": {
+                    "project": "wikibooks",
+                    "language": "Catalan"
+                },
+                ...
+            },
+            "prettyProjectNames": {
+                "commons": "Commons",
+                "wiki": "Wikipedia",
+                ...
+            },
+        }
+    """
+    all_wikis = requests.get('http://meta.wikimedia.org/w/api.php?action=sitematrix'
+                             '&smsiteprop=url|dbname|code'
+                             '&smstate=all'
+                             '&format=json').json()
+
+    # parse out the data in three different ways
+    languages = []
+    projects = {}
+    reverse = {}
+
+    for k, content in all_wikis.get('sitematrix', {}).items():
+        if k == 'count':
+            continue
+
+        name = 'All Languages'
+        code = 'all'
+        site_list = content
+        if k != 'specials':
+            name = content.get('localname')
+            code = content.get('code')
+            site_list = content.get('site')
+
+        if not name or not code or not site_list:
+            continue
+
+        sites = {
+            site['code']: site['dbname']
+            for site in site_list if 'private' not in site
+            if limit_to is None or site['dbname'] in limit_to
+        }
+        if sites:
+            length = len(sites)
+
+            # manually add the overall aggregate
+            if name == 'All Languages':
+                sites['totals'] = 'all'
+                length = length + 1
+
+            languages.append({
+                'name': name,
+                'shortName': code,
+                'description': description('project', length),
+                'projects': sites
+            })
+
+            for project, dbname in sites.items():
+                if project not in projects:
+                    projects[project] = {
+                        'name': project,
+                        'languages': {},
+                        'count': 0
+                    }
+                projects[project]['count'] += 1
+                projects[project]['languages'][name] = dbname
+                projects[project]['description'] = description(
+                    'language', projects[project]['count']
+                )
+
+                reverse[dbname] = {
+                    'language': name,
+                    'project': project
+                }
+
+    # manually add the overall aggregate
+    projects['totals'] = {
+        'languages': {
+            'All Languages': 'all'
+        },
+        'count': 1,
+        'name': 'totals',
+        'description': [
+            '1 language'
+        ]
+    }
+    reverse['all'] = {
+        'language': 'All Languages',
+        'project': 'totals'
+    }
+
+    return {
+        'languages': languages,
+        'projects': [v for k, v in projects.items()],
+        'reverse': reverse,
+        'prettyProjectNames': {
+            'commons': 'Commons',
+            'mediawiki': 'MediaWiki',
+            'meta': 'Meta Wikimedia',
+            'nostalgia': 'Nostalgia',
+            'wiki': 'Wikipedia',
+            'wikibooks': 'Wikibooks',
+            'wikidata': 'Wikidata',
+            'wikinews': 'Wikinews',
+            'wikiquote': 'Wikiquote',
+            'wikisource': 'Wikisource',
+            'wikiversity': 'Wikiversity',
+            'wikivoyage': 'Wikivoyage',
+            'wiktionary': 'Wiktionary',
+            'totals': 'Totals',
+        },
+    }
+
+
+def get_metrics_by_category(limit_to=None):
+    """
+    Looks at the metrics definitions to get category information
+
+    Parameters
+        limit_to  : limit output to metrics found in this set (default all metrics)
+
+    Returns
+        A dictionary of this shape: {
+            'categorizedMetrics': [
+                {
+                    "name": "Community",
+                    "metrics": [
+                        {"name":"PagesCreated", "defaultSubmetric":"pages_created"},
+                        {"name":"NamespaceEdits", "defaultSubmetric":"edits"}
+                    ]
+                },
+                ...
+            ]
+        }
+    """
+    from wikimetrics.metrics import metric_classes
+
+    categories = {}
+    default_submetrics = {}
+
+    for metric_name, metric_class in metric_classes.items():
+        if metric_class.show_in_ui is not True:
+            continue
+        if limit_to and metric_name not in limit_to:
+            continue
+
+        default_submetrics[metric_name] = getattr(
+            metric_class, 'default_submetric', metric_class.id
+        )
+
+        category = metric_class.category
+        if category not in categories:
+            categories[category] = {
+                'name': category,
+                'metrics': []
+            }
+        categories[category]['metrics'].append({
+            'name': metric_name,
+            'defaultSubmetric': default_submetrics[metric_name]
+        })
+
+    return {
+        'categorizedMetrics': [v for k, v in categories.items()]
+    }
+
+
+def make_dashiki_configs(args):
+    """
+    Writes available-projects.json and available-metrics.json to /static/public
+    """
+    import os
+    from wikimetrics.configurables import app
+
+    public_folder = os.path.join(
+        app.absolute_path_to_app_root,
+        'static',
+        'public',
+        'datafiles',
+    )
+
+    scheduled_projects = None
+    scheduled_metrics = None
+
+    if (args.global_config is False):
+        if args.user.username != WIKIMETRICS_BOT_NAME:
+            print('... config generation only works for {} or with --all-config'.format(
+                WIKIMETRICS_BOT_NAME
+            ))
+            sys.exit(1)
+        try:
+            scheduled_metrics = set(os.listdir(public_folder))
+            scheduled_projects = set([])
+            for m in scheduled_metrics:
+                metric_folder = os.path.join(public_folder, m)
+                if os.path.isdir(metric_folder):
+                    scheduled_projects = scheduled_projects.union(
+                        PROJECT_FILE.match(p).groups()[0]
+                        for p in os.listdir(metric_folder)
+                    )
+
+        except:
+            print('... could not retrieve {}\'s reports: {}'.format(
+                WIKIMETRICS_BOT_NAME,
+                traceback.format_exc()
+            ))
+            sys.exit(1)
+
+    projects_file = os.path.join(
+        public_folder,
+        'available-projects.json'
+    )
+    metrics_file = os.path.join(
+        public_folder,
+        'available-metrics.json'
+    )
+
+    if args.both or args.wikis_only:
+        projects = get_wikis_we_care_about(limit_to=scheduled_projects)
+        with open(projects_file, 'w') as projects_writer:
+            json.dump(projects, projects_writer, indent=4)
+            print('... {} written'.format(projects_file))
+
+    if args.both or args.metrics_only:
+        metrics = get_metrics_by_category(limit_to=scheduled_metrics)
+        with open(metrics_file, 'w') as metrics_writer:
+            json.dump(metrics, metrics_writer, indent=4)
+            print('... {} written'.format(metrics_file))
+
+
+def run_cohorts(args):
+    print('... validating list of projects')
+    projects = get_public_wikis()
+    if args.projects:
+        invalid_projects = [p for p in args.projects if p not in projects]
+        if invalid_projects:
+            print('These are unknown: {}'.format(invalid_projects))
+            sys.exit(1)
+        valid_projects = args.projects
+    elif args.all_projects:
+        valid_projects = projects
+
+    service = CohortService()
+    try:
+        session = db.get_session()
+        for project in valid_projects:
+            print('... adding "{}"'.format(project))
+            cohort = service.add_wiki_cohort(session, project)
+            service.share(session, cohort, args.user.id)
+    finally:
+        session.remove()
+
+
+def run_reports(args):
+    print('... validating cohorts')
+    from wikimetrics.metrics import metric_classes
+    metric_choices = [k for k, v in metric_classes.items() if v.show_in_ui]
+    while not args.metric or args.metric not in metric_choices:
+        print('Please choose one METRIC: {}'.format(metric_choices))
+        args.metric = sys.stdin.readline().strip()
+
+    service = CohortService()
+    try:
+        session = db.get_session()
+        if args.all_cohorts:
+            valid = service.get_list(session, args.user.id)
+            if not valid:
+                print('This user has no valid cohorts')
+                sys.exit(1)
+        else:
+            while not args.cohorts or not len(args.cohorts) or not args.cohorts[0]:
+                print('Please specify COHORT(s): (eg: enwiki commonswiki rowiki)')
+                args.cohorts = sys.stdin.readline().strip().split(' ')
+            cohorts = set(args.cohorts)
+            invalid = set()
+            unauthorized = set()
+            valid = []
+            for c in cohorts:
+                try:
+                    cohort = service.get(session, args.user.id, by_name=c)
+                    valid.append(cohort)
+                except (NoResultFound, InvalidCohort):
+                    # don't need to roll back session because it's just a query
+                    invalid.add(c)
+                except Unauthorized:
+                    # don't need to roll back session because it's just a query
+                    unauthorized.add(c)
+
+            if invalid or unauthorized:
+                print('Invalid Cohorts: {}'.format(list(invalid)))
+                print('Unauthorized Cohorts: {}'.format(list(unauthorized)))
+                sys.exit(1)
+
+        from wikimetrics.models.report_nodes.run_report import RunReport
+        from wikimetrics.utils import today
+
+        if args.user.username == WIKIMETRICS_BOT_NAME:
+            import os
+            from wikimetrics.configurables import app
+            from wikimetrics.api.file_manager import (
+                PublicReportFileManager, COALESCED_REPORT_FILE
+            )
+            file_manager = PublicReportFileManager(
+                app.logger,
+                app.absolute_path_to_app_root,
+            )
+            print('... will make pretty symlink for {}'.format(WIKIMETRICS_BOT_NAME))
+            public_folder = os.path.join(
+                app.absolute_path_to_app_root,
+                'static',
+                'public',
+            )
+            public_stat = os.stat(public_folder)
+
+            datafiles_folder = os.path.join(
+                public_folder,
+                'datafiles',
+            )
+            if not os.path.exists(datafiles_folder):
+                os.makedirs(datafiles_folder)
+                # keep ownership in the public subdirectory uniform
+                os.chown(datafiles_folder, public_stat.st_uid, public_stat.st_gid)
+
+            symlink_folder = os.path.join(
+                datafiles_folder,
+                args.metric,
+            )
+            if not os.path.exists(symlink_folder):
+                os.makedirs(symlink_folder)
+                # keep ownership in the public subdirectory uniform
+                os.chown(symlink_folder, public_stat.st_uid, public_stat.st_gid)
+
+        start = args.start or today()
+        for cohort in valid:
+            parameters = dict(
+                name='{} - {}'.format(cohort.name, args.metric),
+                cohort=dict(id=cohort.id, name=cohort.name),
+                metric=dict(name=args.metric),
+                recurrent=True,
+                public=True,
+            )
+            # Do not create duplicate reports (we can add an option to force later)
+            existing = session.query(ReportStore)\
+                .filter(ReportStore.recurrent == 1)\
+                .filter(ReportStore.name == parameters['name'])\
+                .filter(ReportStore.user_id == args.user.id)\
+                .count()
+            if existing == 0:
+                report = RunReport(parameters, user_id=args.user.id, created=start)
+                if args.user.username == WIKIMETRICS_BOT_NAME:
+                    path = os.path.join(file_manager.get_public_report_path(
+                        report.persistent_id,
+                        recurrent=True
+                    ), COALESCED_REPORT_FILE)
+                    pretty_path = os.path.join(
+                        symlink_folder,
+                        '{}.json'.format(cohort.name),
+                    )
+                    try:
+                        rel_path = os.path.relpath(path, symlink_folder)
+                        os.symlink(rel_path, pretty_path)
+                        os.lchown(pretty_path, public_stat.st_uid, public_stat.st_gid)
+                    except OSError, err:
+                        print('... ERROR creating pretty link: {}'.format(err))
+
+                print('... queued "{}"'.format(parameters['name']))
+            else:
+                print('... already exists: "{}"'.format(parameters['name']))
+    finally:
+        session.remove()
+
+
+def get_user(args):
+    try:
+        s = db.get_session()
+        print('... looking up user (defaulting to {})'.format(WIKIMETRICS_BOT_NAME))
+        q = s.query(UserStore)
+        if args.user:
+            u = q.get(args.user)
+        else:
+            u = q.filter(UserStore.username == WIKIMETRICS_BOT_NAME).one()
+        print('... found user "{}", id: "{}"'.format(u.username or u.email, u.id))
+        args.user = u
+
+    except Exception, e:
+        print(e)
+        sys.exit(1)
+    finally:
+        s.remove()
+
+
+parser = argparse.ArgumentParser(description='Manage cohorts or reports in bulk')
+parser.add_argument(
+    '-u', '--user',
+    help='Owner of any new records being inserted (default: id of WikimetricsBot)',
+    type=int,
+)
+
+subparsers = parser.add_subparsers(help='Different modes of administration')
+
+parse_cohorts = subparsers.add_parser('cohorts', help='Add wiki cohorts to a user')
+parse_reports = subparsers.add_parser('reports', help='Add recurrent reports for a user')
+parse_dashiki = subparsers.add_parser('dashiki', help='Create files for dashiki')
+
+parse_cohorts.set_defaults(func=run_cohorts)
+parse_reports.set_defaults(func=run_reports)
+parse_dashiki.set_defaults(func=make_dashiki_configs)
+
+parse_cohorts_projects = parse_cohorts.add_mutually_exclusive_group(required=True)
+parse_cohorts_projects.add_argument(
+    '-p', '--projects',
+    help='List of projects to add (default: no projects)',
+    nargs='+',
+)
+parse_cohorts_projects.add_argument(
+    '-a', '--all-projects',
+    help='Add all known projects',
+    action='store_true',
+)
+
+parse_reports.add_argument(
+    '-m', '--metric',
+    help='Name of a single metric to add reports for.  '
+         'Name is case sensitive and will be validated '
+         '(eg. BytesAdded, NamespaceEdits, NewlyRegistered, etc.)',
+)
+parse_reports.add_argument(
+    '-s', '--start',
+    help='Date to start the report, in YYYY-MM-DD format (default: today)',
+    type=lambda s: datetime.strptime(s, '%Y-%m-%d'),
+)
+parse_reports_cohorts = parse_reports.add_mutually_exclusive_group(required=True)
+# NOTE: the -c shorthand causes collisions with wikimetrics' argparse setup
+parse_reports_cohorts.add_argument(
+    '--cohorts',
+    help='List of cohorts to add reports for (default: no cohorts)',
+    nargs='+',
+)
+parse_reports_cohorts.add_argument(
+    '--all-cohorts',
+    help='Add a report for each cohort assigned to this user',
+    action='store_true',
+)
+
+parse_dashiki.add_argument(
+    '-g', '--global-config',
+    help='Make config whether metrics/wikis are generated by recurrent reports or not',
+    action='store_true',
+)
+parse_dashiki_type = parse_dashiki.add_mutually_exclusive_group(required=True)
+parse_dashiki_type.add_argument(
+    '--metrics-only',
+    help='Only make configuration for metrics',
+    action='store_true',
+)
+parse_dashiki_type.add_argument(
+    '--wikis-only',
+    help='Only make configuration for wikis',
+    action='store_true',
+)
+parse_dashiki_type.add_argument(
+    '--both',
+    help='Make configuration for both metrics and wikis',
+    action='store_true',
+)
+
+args = parser.parse_args()
+# TODO: importing earlier makes the wikimetrics argparse clash with this file's argparse
+from wikimetrics.configurables import db
+from wikimetrics.models import UserStore, ReportStore
+from wikimetrics.api.cohorts import CohortService
+from wikimetrics.exceptions import InvalidCohort, Unauthorized
+from sqlalchemy.orm.exc import NoResultFound
+
+get_user(args)
+args.func(args)

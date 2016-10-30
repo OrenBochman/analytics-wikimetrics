@@ -1,6 +1,8 @@
 import celery
+import traceback
 from uuid import uuid4
 from celery import current_task
+from datetime import datetime
 # AsyncResult shows up as un-needed but actually is (for celery.states to work)
 from celery.result import AsyncResult
 from celery.exceptions import SoftTimeLimitExceeded
@@ -9,7 +11,8 @@ from celery.utils.log import get_task_logger
 # from celery.contrib.methods import task_method
 from flask.ext.login import current_user
 from wikimetrics.configurables import db, queue
-from ..persistent_report import PersistentReport
+from wikimetrics.utils import stringify
+from wikimetrics.models.storage import ReportStore, TaskErrorStore
 
 
 __all__ = [
@@ -46,7 +49,15 @@ def queue_task(report):
         report,
         current_task.request.id,
     ))
-    return report.run()
+    try:
+        return report.run()
+    except Exception, e:
+        # Create a task error with the failure information.
+        if report.persistent_id is not None:
+            message = '%s: %s' % (type(e).__name__, e.message)
+            trace = traceback.format_exc()
+            TaskErrorStore.add('report', report.persistent_id, message, trace)
+        raise e
 
 
 class Report(object):
@@ -59,9 +70,17 @@ class Report(object):
                  status=celery.states.PENDING,
                  name=None,
                  queue_result_key=None,
-                 children=[],
-                 parameters='{}'):
+                 children=None,
+                 public=False,
+                 parameters={},
+                 recurrent=False,
+                 recurrent_parent_id=None,
+                 created=None,
+                 store=False,
+                 persistent_id=None):
         
+        if children is None:
+            children = []
         self.user_id = user_id
         if not self.user_id:
             try:
@@ -76,40 +95,56 @@ class Report(object):
         self.name = name
         self.queue_result_key = queue_result_key
         self.children = children
-        
-        # store report to database
-        # note that queue_result_key is always empty at this stage
-        pj = PersistentReport(user_id=self.user_id,
-                              status=self.status,
-                              show_in_ui=self.show_in_ui,
-                              parameters=parameters)
-        session = db.get_session()
-        try:
-            session.add(pj)
-            session.commit()
-            self.persistent_id = pj.id
-            pj.name = self.name or str(self)
-            session.commit()
-        finally:
-            session.close()
+        self.public = public
+        self.store = store
+        self.persistent_id = persistent_id
+        self.created = None
+
+        if self.store is True and self.persistent_id is None:
+            # store report to database
+            # note that queue_result_key is always empty at this stage
+            pj = ReportStore(user_id=self.user_id,
+                             status=self.status,
+                             show_in_ui=self.show_in_ui,
+                             parameters=stringify(parameters).encode('utf-8'),
+                             public=self.public,
+                             recurrent=recurrent,
+                             recurrent_parent_id=recurrent_parent_id,
+                             created=created or datetime.now())
+            try:
+                session = db.get_session()
+                session.add(pj)
+                session.commit()
+                self.persistent_id = pj.id
+                self.created = pj.created
+                pj.name = self.name or str(self)
+                session.commit()
+            except:
+                session.rollback()
+                raise
     
     def __repr__(self):
-        return '<Report("{0}")>'.format(self.persistent_id)
+        if self.persistent_id is not None:
+            persistent_id = self.persistent_id
+        else:
+            persistent_id = 'no persistent id'
+        return '<{0}("{1}")>'.format(type(self).__name__, persistent_id)
     
+    # TODO if this function needs to use the db session it should be passed on
+    # on method params not retrieved from a singleton
     def set_status(self, status, task_id=None):
         """
         helper function for updating database status after celery
         task has been started
         """
-        session = db.get_session()
-        try:
-            pj = session.query(PersistentReport).get(self.persistent_id)
+        self.status = status
+        if self.store is True:
+            session = db.get_session()
+            pj = session.query(ReportStore).get(self.persistent_id)
             pj.status = status
             if task_id:
                 pj.queue_result_key = task_id
             session.commit()
-        finally:
-            session.close()
     
     def run(self):
         """
@@ -133,7 +168,6 @@ class ReportNode(Report):
         """
         self.set_status(celery.states.STARTED, task_id=current_task.request.id)
         results = []
-        
         if self.children:
             try:
                 child_results = [child.run() for child in self.children]
@@ -146,18 +180,37 @@ class ReportNode(Report):
                 raise
         
         self.set_status(celery.states.SUCCESS)
+        self.post_process(results)
         return results
     
-    def finish(self, results):
+    def finish(self, child_results):
         """
-        Each ReportNode sublcass should implement this method to deal with
-        the results of its child reports.  As a standard, report_results should
+        Each ReportNode subclass should implement this method to deal with
+        the results of its child reports.  As a standard, report_result should
         be called at the end of ReportNode.finish implementations.
+        
+        Parameters:
+            child_results: array of strings
         """
         pass
     
-    def report_result(self, results, child_results=[]):
+    def post_process(self, results):
         """
+        Each ReportNode subclass can implement this method to deal with
+        the results of its child reports. This is called after finish only in the case
+        of the task succeeding.
+        This method is not meant to return any value.
+        
+        Parameters:
+            results: string
+        """
+        pass
+    
+    def report_result(self, results, child_results=None):
+        """
+        NOTE: child_results is currently not used.  This function will still work
+        as originally implemented, but child_results should go under evaluation.
+        
         Creates a unique identifier for this ReportNode, and returns a one element
         dictionary with that identifier as the key and its results as the value.
         This allows ReportNode results to be merged as the tree of ReportNodes is
@@ -169,13 +222,17 @@ class ReportNode(Report):
                               preserved.  ReportLeaf results and any ReportNode results
                               that are copied should not be preserved.
         """
+        if child_results is None:
+            child_results = []
+        
         self.result_key = str(uuid4())
-        db_session = db.get_session()
-        pj = db_session.query(PersistentReport).get(self.persistent_id)
-        pj.result_key = self.result_key
-        db_session.add(pj)
-        db_session.commit()
-        db_session.close()
+
+        if self.store:
+            db_session = db.get_session()
+            pj = db_session.query(ReportStore).get(self.persistent_id)
+            pj.result_key = self.result_key
+            db_session.add(pj)
+            db_session.commit()
         
         merged = {self.result_key: results}
         for child_result in child_results:

@@ -2,22 +2,37 @@ import unittest
 import sys
 from itertools import product
 from datetime import datetime
-from wikimetrics.utils import parse_date, \
-    format_date, parse_pretty_date, format_pretty_date
 from nose.tools import nottest
+from mock import Mock
+from logging import RootLogger, getLogger
 
-__all__ = [
-    'DatabaseTest',
-    'DatabaseWithSurvivorCohortTest',
-    'QueueTest',
-    'QueueDatabaseTest',
-    'WebTest',
-    'i',
-    'd',
-    'tz_note',
-]
+from wikimetrics.utils import (
+    parse_date, format_date, parse_pretty_date, format_pretty_date, UNICODE_NULL
+)
+from wikimetrics.configurables import db
+from wikimetrics.models import (
+    UserStore,
+    WikiUserStore,
+    WikiUserKey,
+    CohortStore,
+    CohortWikiUserStore,
+    CohortUserStore,
+    TagStore,
+    CohortTagStore,
+    ReportStore,
+    TaskErrorStore,
+    Revision,
+    Page,
+    MediawikiUser,
+    MediawikiUserGroups,
+    Logging,
+    Archive,
+    CentralAuthLocalUser,
+)
+from wikimetrics.enums import CohortUserRole
 
-
+mediawiki_project = 'wiki'
+second_mediawiki_project = 'wiki2'
 tz_note = 'NOTE: if this test is failing by + or - one hour, '\
           'it is *most* likely that Daylight Savings Time is '\
           'in between registration and the revisions you are '\
@@ -40,22 +55,6 @@ def d(integer):
     return parse_date(str(integer))
 
 
-from wikimetrics.configurables import db
-from wikimetrics.models import (
-    User,
-    WikiUser,
-    Cohort,
-    CohortWikiUser,
-    CohortUserRole,
-    CohortUser,
-    PersistentReport,
-    Revision,
-    Page,
-    MediawikiUser,
-    Logging,
-)
-
-
 class DatabaseTest(unittest.TestCase):
     """
     WARNING: this DESTROYS ALL DATA
@@ -64,24 +63,8 @@ class DatabaseTest(unittest.TestCase):
              as part of test runs
     """
     
-    def runTest(self):
-        pass
-    
     @nottest
-    def create_test_cohort(
-        self,
-        name='test-specific',
-        editor_count=0,
-        user_registrations=20130101000000,
-        revisions_per_editor=0,
-        revision_timestamps=[],
-        revision_lengths=[],
-        page_count=0,
-        page_timestamps=[],
-        page_namespaces=[],
-        page_creator_index=[],
-        owner_user_id=None,
-    ):
+    def create_test_cohort(self, **kargs):
         """
         A fast and easy way to create most of the testing data that Metrics need.
         Creates a page, editors with specified registration dates, and a number of
@@ -96,11 +79,11 @@ class DatabaseTest(unittest.TestCase):
                                         an array of length editor_count
             revisions_per_editor    : count of revisions we want for each editor
             revision_timestamps     : the timestamp of each revision either as
-                                        an integer that applies to all revisions OR
-                                        a two dimensional array indexed by
+                                        an integer, or datetime that applies to all
+                                        revisions OR a two dimensional array indexed by
                                             editor from 0 to editor_count-1
                                             revision from 0 to revisions_per_editor-1
-            revision_timestamps     : the length of each revision either as
+            revision_lengths        : the length of each revision either as
                                         an integer that applies to all revisions OR
                                         a two dimensional array indexed by
                                             editor from 0 to editor_count-1
@@ -117,6 +100,10 @@ class DatabaseTest(unittest.TestCase):
                                         assign all pages to the same editor or an
                                         array to specify each one individually
             owner_user_id           : record in the User table that owns this cohort
+            page_touched            : required for Page creation, usually default is ok
+            user_email_token_expires: required for User creation, usually default is ok
+            mwSession               : the MediaWiki session to use.
+                                        Default: self.mwSession
         
         Returns
             Nothing but creates the following, to be accessed in a test:
@@ -125,6 +112,57 @@ class DatabaseTest(unittest.TestCase):
               self.editors      : the mediawiki editors from the cohort
               self.revisions    : the revisions added, in a two dimensional array
         """
+        self.create_test_data(**kargs)
+
+    @nottest
+    def helper_insert_editors(self, **kargs):
+        """
+        Almost the exact same as `create_test_cohort` EXCEPT:
+            * does not create a cohort
+            * does not set self.cohort, self.page, self.editors, or self.revisions
+            * does not take an `owner_user_id` parameter
+        """
+        if 'name' not in kargs:
+            kargs['name'] = 'test-without-cohort'
+        kargs['create_cohort'] = False
+        self.create_test_data(**kargs)
+
+    @nottest
+    def create_test_data(
+        self,
+        name='test-specific',
+        editor_count=0,
+        user_registrations=20130101000000,
+        revisions_per_editor=0,
+        revision_timestamps=None,
+        revision_lengths=None,
+        page_count=0,
+        page_timestamps=None,
+        page_namespaces=None,
+        page_creator_index=None,
+        owner_user_id=None,
+        page_touched=20130102000000,
+        user_email_token_expires=20200101000000,
+        create_cohort=True,
+        mw_session=None,
+    ):
+        """
+        Internal multi-purpose data creator.
+        Creates a set of users and, if `name` is specified, wraps them in a cohort.
+        """
+        if revision_timestamps is None:
+            revision_timestamps = []
+        if revision_lengths is None:
+            revision_lengths = []
+        if page_timestamps is None:
+            page_timestamps = []
+        if page_namespaces is None:
+            page_namespaces = []
+        if page_creator_index is None:
+            page_creator_index = []
+        
+        if type(revision_timestamps) is datetime:
+            revision_timestamps = i(revision_timestamps)
         if type(revision_timestamps) is int:
             revision_timestamps = [
                 [revision_timestamps] * revisions_per_editor
@@ -138,149 +176,227 @@ class DatabaseTest(unittest.TestCase):
         if type(user_registrations) is int:
             user_registrations = [user_registrations] * editor_count
         
-        self.project = 'enwiki'
+        project = mediawiki_project
+        if create_cohort:
+            cohort = CohortStore(
+                name='{0}-cohort'.format(name),
+                enabled=True,
+                public=False,
+                validated=True,
+            )
+            self.session.add(cohort)
+            self.session.commit()
         
-        self.cohort = Cohort(
-            name='{0}-cohort'.format(name),
-            enabled=True,
-            public=False,
-            validated=True,
-        )
-        self.session.add(self.cohort)
-        self.session.commit()
+        if not mw_session:
+            mw_session = self.mwSession
         
-        self.page = Page(page_namespace=0, page_title='{0}-page'.format(name))
-        self.mwSession.add(self.page)
-        self.mwSession.commit()
+        page = Page(page_namespace=0, page_title='{0}-page'.format(name),
+                    page_touched=page_touched)
+        mw_session.add(page)
+        mw_session.commit()
         
-        self.mwSession.bind.engine.execute(
+        mw_session.bind.engine.execute(
             MediawikiUser.__table__.insert(), [
                 {
                     'user_name': 'Editor {0}-{1}'.format(name, e),
                     'user_registration': user_registrations[e],
+                    'user_email_token_expires': user_email_token_expires
                 }
                 for e in range(editor_count)
             ]
         )
-        self.mwSession.commit()
-        self.editors = self.mwSession.query(MediawikiUser)\
+        mw_session.commit()
+        self.add_centralauth_users(['Editor {0}-0'.format(name)], ['wiki', 'wiki2'])
+        editors = mw_session.query(MediawikiUser)\
             .filter(MediawikiUser.user_name.like('Editor {0}-%'.format(name)))\
             .order_by(MediawikiUser.user_id)\
             .all()
-        self.session.bind.engine.execute(
-            WikiUser.__table__.insert(), [
+
+        # Create logging table records for each inserted user
+        mw_session.bind.engine.execute(
+            Logging.__table__.insert(), [
                 {
-                    'mediawiki_username'    : editor.user_name,
-                    'mediawiki_userid'      : editor.user_id,
-                    'project'               : self.project,
-                    'valid'                 : True,
-                    'validating_cohort'     : self.cohort.id,
+                    'log_user': editor.user_id,
+                    'log_timestamp': editor.user_registration,
+                    'log_title': editor.user_name,
+                    'log_type': 'newusers',
+                    'log_action': 'create',
                 }
-                for editor in self.editors
+                for editor in editors
             ]
         )
-        self.session.commit()
-        wiki_users = self.session.query(WikiUser)\
-            .filter(WikiUser.mediawiki_username.like('Editor {0}-%'.format(name)))\
-            .all()
-        self.session.bind.engine.execute(
-            CohortWikiUser.__table__.insert(), [
-                {
-                    'cohort_id'     : self.cohort.id,
-                    'wiki_user_id'  : wiki_user.id,
-                }
-                for wiki_user in wiki_users
-            ]
-        )
-        self.session.commit()
+        mw_session.commit()
+
+        if create_cohort:
+            self.session.bind.engine.execute(
+                WikiUserStore.__table__.insert(), [
+                    {
+                        'raw_id_or_name'        : editor.user_name or editor.user_id,
+                        'mediawiki_username'    : editor.user_name,
+                        'mediawiki_userid'      : editor.user_id,
+                        'project'               : project,
+                        'valid'                 : True,
+                        'validating_cohort'     : cohort.id,
+                    }
+                    for editor in editors
+                ]
+            )
+            self.session.commit()
+            wiki_users = self.session.query(WikiUserStore)\
+                .filter(
+                    WikiUserStore.mediawiki_username.like('Editor {0}-%'.format(name)))\
+                .all()
+            self.session.bind.engine.execute(
+                CohortWikiUserStore.__table__.insert(), [
+                    {
+                        'cohort_id'     : cohort.id,
+                        'wiki_user_id'  : wiki_user.id,
+                    }
+                    for wiki_user in wiki_users
+                ]
+            )
+            self.session.commit()
         
-        self.mwSession.bind.engine.execute(
+        mw_session.bind.engine.execute(
             Revision.__table__.insert(), [
                 {
-                    'rev_page'      : self.page.page_id,
-                    'rev_user'      : self.editors[e].user_id,
+                    'rev_page'      : page.page_id,
+                    'rev_user'      : editors[e].user_id,
                     'rev_comment'   : 'revision {0}, editor {1}'.format(r, e),
-                    'rev_timestamp' : revision_timestamps[e][r],
+                    'rev_timestamp' : revision_timestamps[e][r] or UNICODE_NULL * 14,
                     'rev_len'       : revision_lengths[e][r],
                     # rev_parent_id will be set below, following chronology
                 }
                 for e, r in product(range(editor_count), range(revisions_per_editor))
             ]
         )
-        self.mwSession.commit()
-        self.revisions = self.mwSession.query(Revision)\
-            .filter(Revision.rev_page == self.page.page_id)\
+        mw_session.commit()
+        revisions = mw_session.query(Revision)\
+            .filter(Revision.rev_page == page.page_id)\
             .order_by(Revision.rev_id)\
             .all()
         
         # add rev_parent_id chain in chronological order
-        real_revisions = filter(lambda r: r.rev_timestamp, self.revisions)
+        real_revisions = filter(lambda r: r.rev_timestamp, revisions)
         ordered_revisions = sorted(real_revisions, key=lambda r: r.rev_timestamp)
-        for i, revision in enumerate(ordered_revisions):
-            if i == 0:
+        for idx, revision in enumerate(ordered_revisions):
+            if idx == 0:
                 revision.rev_parent_id = 0
             else:
-                revision.rev_parent_id = ordered_revisions[i - 1].rev_id
+                revision.rev_parent_id = ordered_revisions[idx - 1].rev_id
         
-        self.mwSession.commit()
+        mw_session.commit()
         
-        # establish ownership for this cohort
-        if not owner_user_id:
-            owner_user = User(username='test cohort owner', email='test@test.com')
-            self.session.add(owner_user)
+        if create_cohort:
+            # establish ownership for this cohort
+            if not owner_user_id:
+                owner = UserStore(username='test cohort owner', email='test@test.com')
+                self.session.add(owner)
+                self.session.commit()
+                owner_user_id = owner.id
+
+            self.session.add(CohortUserStore(
+                user_id=owner_user_id,
+                cohort_id=cohort.id,
+                role=CohortUserRole.OWNER,
+            ))
             self.session.commit()
-            self.owner_user_id = owner_user.id
         
-        self.session.add(CohortUser(
-            user_id=self.owner_user_id,
-            cohort_id=self.cohort.id,
-            role=CohortUserRole.OWNER,
+        if page_count > 0:
+            # create any additional pages
+            if type(page_timestamps) is int:
+                page_timestamps = [page_timestamps] * page_count
+            if type(page_namespaces) is int:
+                page_namespaces = [page_namespaces] * page_count
+            if type(page_creator_index) is int:
+                page_creator_index = [page_creator_index] * page_count
+            
+            mw_session.bind.engine.execute(
+                Page.__table__.insert(), [
+                    {
+                        'page_namespace'    : page_namespaces[p],
+                        'page_title'        : '{0}-additional-page-{1}'.format(name, p),
+                        'page_touched'      : page_touched
+                    }
+                    for p in range(page_count)
+                ]
+            )
+            mw_session.commit()
+            pages = mw_session.query(Page)\
+                .filter(Page.page_title.like('{0}-additional-page-%'.format(name)))\
+                .order_by(Page.page_id)\
+                .all()
+            
+            mw_session.bind.engine.execute(
+                Revision.__table__.insert(), [
+                    {
+                        'rev_page'      : pages[p].page_id,
+                        'rev_user'      : editors[page_creator_index[p]].user_id,
+                        'rev_comment'   : 'page {0} created'.format(p),
+                        'rev_timestamp' : page_timestamps[p],
+                        'rev_len'       : 10,
+                        'rev_parent_id' : 0,
+                    }
+                    for p in range(page_count)
+                ]
+            )
+            mw_session.commit()
+
+        if create_cohort:
+            self.project = project
+
+            # TODO this is a storage object, should be changed
+            # for metrics tests into a logic object, not a storage object
+            self.cohort = cohort
+            self.page = page
+            self.editors = editors
+            self.editor_ids = [e.user_id for e in editors]
+            self.revisions = revisions
+            self.owner_user_id = owner_user_id
+
+    @nottest
+    def add_centralauth_users(self, usernames, projects):
+        """
+         Adds users to centralauth's localuser table  with corresponding projects.
+         usernames: A list containing usernames to be added
+         projects: A list of projects each username will be associated with
+
+         usernames = ['Terrrydactyl', 'Milimetric']
+         projects = ['wiki', 'wiki2']
+
+         Will result in:
+         Terrrydactyl, wiki
+         Terrrydactyl, wiki2
+         Milimetric, wiki
+         Milimetric, wiki2
+        """
+        self.caSession.bind.engine.execute(
+            CentralAuthLocalUser.__table__.insert(),
+            [
+                {
+                    'lu_wiki': project,
+                    'lu_name': username
+                }
+                for project in projects
+                for username in usernames
+            ]
+        )
+        self.caSession.commit()
+
+    @nottest
+    def editor(self, index):
+        """Gets the proper key to look up a member of a create_test_cohort result"""
+        return str(WikiUserKey(
+            self.editors[index].user_id,
+            mediawiki_project,
+            self.cohort.id,
         ))
-        self.session.commit()
-        
-        # create any additional pages
-        if type(page_timestamps) is int:
-            page_timestamps = [page_timestamps] * page_count
-        if type(page_namespaces) is int:
-            page_namespaces = [page_namespaces] * page_count
-        if type(page_creator_index) is int:
-            page_creator_index = [page_creator_index] * page_count
-        
-        self.mwSession.bind.engine.execute(
-            Page.__table__.insert(), [
-                {
-                    'page_namespace'    : page_namespaces[p],
-                    'page_title'        : '{0}-additional-page-{1}'.format(name, p)
-                }
-                for p in range(page_count)
-            ]
-        )
-        self.mwSession.commit()
-        pages = self.mwSession.query(Page)\
-            .filter(Page.page_title.like('{0}-additional-page-%'.format(name)))\
-            .order_by(Page.page_id)\
-            .all()
-        
-        self.mwSession.bind.engine.execute(
-            Revision.__table__.insert(), [
-                {
-                    'rev_page'      : pages[p].page_id,
-                    'rev_user'      : self.editors[page_creator_index[p]].user_id,
-                    'rev_comment'   : 'page {0} created'.format(p),
-                    'rev_timestamp' : page_timestamps[p],
-                    'rev_len'       : 10,
-                    'rev_parent_id' : 0,
-                }
-                for p in range(page_count)
-            ]
-        )
-        self.mwSession.commit()
     
     @nottest
     def helper_reset_validation(self):
-        wikiusers = self.session.query(WikiUser) \
-            .join(CohortWikiUser) \
-            .filter(CohortWikiUser.cohort_id == self.cohort.id) \
+        wikiusers = self.session.query(WikiUserStore) \
+            .join(CohortWikiUserStore) \
+            .filter(CohortWikiUserStore.cohort_id == self.cohort.id) \
             .all()
         for wu in wikiusers:
             wu.validating_cohort = self.cohort.id
@@ -291,15 +407,20 @@ class DatabaseTest(unittest.TestCase):
     
     @nottest
     def helper_remove_authorization(self):
-        cu = self.session.query(CohortUser) \
-            .filter(CohortUser.cohort_id == self.cohort.id) \
+        cu = self.session.query(CohortUserStore) \
+            .filter(CohortUserStore.cohort_id == self.cohort.id) \
             .one()
         cu.role = 'UNAUTHORIZED'
         self.session.commit()
     
     @nottest
-    def common_cohort_1(self):
-        self.create_test_cohort(
+    def common_cohort_1(self, cohort=True):
+        if cohort:
+            method = self.create_test_cohort
+        else:
+            method = self.helper_insert_editors
+
+        method(
             editor_count=4,
             revisions_per_editor=4,
             revision_timestamps=[
@@ -312,8 +433,13 @@ class DatabaseTest(unittest.TestCase):
         )
     
     @nottest
-    def common_cohort_2(self):
-        self.create_test_cohort(
+    def common_cohort_2(self, cohort=True):
+        if cohort:
+            method = self.create_test_cohort
+        else:
+            method = self.helper_insert_editors
+
+        method(
             editor_count=3,
             revisions_per_editor=3,
             revision_timestamps=[
@@ -329,8 +455,13 @@ class DatabaseTest(unittest.TestCase):
         )
     
     @nottest
-    def common_cohort_3(self):
-        self.create_test_cohort(
+    def common_cohort_3(self, cohort=True):
+        if cohort:
+            method = self.create_test_cohort
+        else:
+            method = self.helper_insert_editors
+
+        method(
             editor_count=4,
             revisions_per_editor=4,
             # in order, all in 2013:
@@ -352,8 +483,13 @@ class DatabaseTest(unittest.TestCase):
         )
     
     @nottest
-    def common_cohort_4(self):
-        self.create_test_cohort(
+    def common_cohort_4(self, cohort=True):
+        if cohort:
+            method = self.create_test_cohort
+        else:
+            method = self.helper_insert_editors
+
+        method(
             editor_count=2,
             revisions_per_editor=1,
             revision_timestamps=20130416000000,
@@ -367,8 +503,13 @@ class DatabaseTest(unittest.TestCase):
         )
     
     @nottest
-    def common_cohort_5(self):
-        self.create_test_cohort(
+    def common_cohort_5(self, cohort=True):
+        if cohort:
+            method = self.create_test_cohort
+        else:
+            method = self.helper_insert_editors
+
+        method(
             editor_count=4,
             revisions_per_editor=4,
             revision_timestamps=[
@@ -379,36 +520,174 @@ class DatabaseTest(unittest.TestCase):
             ],
             revision_lengths=10,
         )
-    
+
+    @nottest
+    def create_non_editors(self, user_tuples, name='some-identifier'):
+        """
+        Creates plain users that haven't edited anything.
+        You should pass a unique prefix parameter if called 2+ times before tearDown.
+
+        Parameters
+            user_tuples : tuples in the form:
+                          (<user_registration>, <log_type>, <log_action>)
+        """
+        by_name = {
+            'non-editor-user-{0}-{1}'.format(name, i): u
+            for i, u in enumerate(user_tuples)
+        }
+        self.mwSession.bind.engine.execute(
+            MediawikiUser.__table__.insert(), [
+                {
+                    'user_name': key,
+                    'user_registration': user[0],
+                    'user_email_token_expires': 20200101000000,
+                }
+                for key, user in by_name.items()
+            ]
+        )
+        self.mwSession.commit()
+        self.non_editors = users = self.mwSession.query(MediawikiUser)\
+            .filter(MediawikiUser.user_name.like('non-editor-user-{0}-%'.format(name)))\
+            .order_by(MediawikiUser.user_id)\
+            .all()
+
+        self.mwSession.bind.engine.execute(
+            Logging.__table__.insert(), [
+                {
+                    'log_user': user.user_id,
+                    'log_title': user.user_name,
+                    'log_timestamp': user.user_registration,
+                    'log_type': by_name[user.user_name][1],
+                    'log_action': by_name[user.user_name][2],
+                }
+                for user in users
+            ]
+        )
+        self.mwSession.commit()
+
+    @nottest
+    def create_wiki_cohort(self, project=mediawiki_project):
+        """
+        Creates a wiki cohort (spans a whole project)
+        and an owner for the cohort
+        """
+        # cohort data
+        basic_wiki_cohort = CohortStore(name='{0}-wiki-cohort'.format(project),
+                                        enabled=True,
+                                        public=False,
+                                        default_project=project,
+                                        class_name='WikiCohort'
+                                        )
+        self.session.add(basic_wiki_cohort)
+        self.session.commit()
+        self.basic_wiki_cohort = basic_wiki_cohort
+        
+        owner = UserStore(username='test cohort owner', email='test@test.com')
+        self.session.add(owner)
+        self.session.commit()
+        self.owner_user_id = owner.id
+        
+        cohort_user = CohortUserStore(
+            user_id=self.owner_user_id,
+            cohort_id=basic_wiki_cohort.id,
+            role=CohortUserRole.OWNER
+        )
+        self.session.add(cohort_user)
+        self.session.commit()
+        self.basic_wiki_cohort_owner = cohort_user
+
+    def archive_revisions(self):
+        """
+        Archive all the revisions in the revision table
+        NOTE: only populates ar_page_id, ar_namespace, ar_timestamp, and ar_user
+        NOTE: leaves ar_rev_id NULL because that's valid and a good edge case
+        NOTE: creates duplicates with NULL ar_rev_id
+        """
+        query = self.mwSession.query(
+            Revision.rev_timestamp,
+            Revision.rev_user,
+            Revision.rev_parent_id,
+            Page.page_namespace,
+            Page.page_id,
+        ).join(Page)
+        revisions = query.all()
+
+        self.mwSession.execute(
+            Archive.__table__.insert(), [
+                {
+                    'ar_rev_id': None,
+                    'ar_timestamp': r.rev_timestamp,
+                    'ar_user': r.rev_user,
+                    'ar_parent_id': r.rev_parent_id,
+                    'ar_namespace': r.page_namespace,
+                    'ar_page_id': r.page_id,
+                }
+                for r in revisions
+            ]
+        )
+
+        self.mwSession.query(Revision).delete()
+        self.mwSession.commit()
+
+    def make_bot(self, user_id, session):
+        """
+        Update the database to make user_id a bot
+        """
+        session.add(MediawikiUserGroups(ug_user=user_id, ug_group='bot'))
+        session.commit()
+
     def setUp(self):
         #****************************************************************
         # set up and clean database (Warning: this DESTROYS ALL DATA)
         #****************************************************************
-        project = 'enwiki'
         self.session = db.get_session()
-        engine = db.get_mw_engine(project)
+        engine = db.get_mw_engine(mediawiki_project)
         db.MediawikiBase.metadata.create_all(engine, checkfirst=True)
-        self.mwSession = db.get_mw_session(project)
+        engine2 = db.get_mw_engine(second_mediawiki_project)
+        db.MediawikiBase.metadata.create_all(engine2, checkfirst=True)
+        ca_engine = db.get_ca_engine()
+        db.CentralAuthBase.metadata.create_all(ca_engine)
+        # mediawiki_project is a global defined on this file
+        self.mwSession = db.get_mw_session(mediawiki_project)
+        self.mwSession2 = db.get_mw_session(second_mediawiki_project)
+        self.caSession = db.get_ca_session()
         DatabaseTest.tearDown(self)
     
     def tearDown(self):
-        
+
         # delete records
         self.mwSession.query(Logging).delete()
         self.mwSession.query(Revision).delete()
+        self.mwSession.query(Archive).delete()
+        self.mwSession.query(MediawikiUserGroups).delete()
         self.mwSession.query(MediawikiUser).delete()
         self.mwSession.query(Page).delete()
         self.mwSession.commit()
-        self.mwSession.close()
+        self.mwSession.remove()
         
-        self.session.query(CohortWikiUser).delete()
-        self.session.query(CohortUser).delete()
-        self.session.query(WikiUser).delete()
-        self.session.query(Cohort).delete()
-        self.session.query(User).delete()
-        self.session.query(PersistentReport).delete()
+        self.mwSession2.query(Logging).delete()
+        self.mwSession2.query(Revision).delete()
+        self.mwSession2.query(Archive).delete()
+        self.mwSession2.query(MediawikiUser).delete()
+        self.mwSession2.query(Page).delete()
+        self.mwSession2.commit()
+        self.mwSession2.remove()
+        
+        self.caSession.query(CentralAuthLocalUser).delete()
+        self.caSession.commit()
+        self.caSession.close()
+
+        self.session.query(CohortTagStore).delete()
+        self.session.query(TagStore).delete()
+        self.session.query(CohortWikiUserStore).delete()
+        self.session.query(CohortUserStore).delete()
+        self.session.query(WikiUserStore).delete()
+        self.session.query(CohortStore).delete()
+        self.session.query(UserStore).delete()
+        self.session.query(TaskErrorStore).delete()
+        self.session.query(ReportStore).delete()
         self.session.commit()
-        self.session.close()
+        self.session.remove()
 
 
 class QueueTest(unittest.TestCase):
@@ -446,7 +725,17 @@ class WebTestAnonymous(DatabaseTest):
         """
         DatabaseTest.setUp(self)
         self.common_cohort_5()
-        self.app = app.test_client()
+        app.testing = True
+        self.client = app.test_client()
+        
+        # TODO change all tests, tests than inherit from
+        # WebTest expect self.app = app.test_client()
+        # this is confusing, app and test_client are two different things
+        # app should refer to the global object
+        # have changed only test_reports.py to use client
+        self.app = self.client
+        
+        self.logger = Mock(spec=RootLogger)
     
     def tearDown(self):
         DatabaseTest.tearDown(self)
@@ -472,148 +761,3 @@ class WebTest(WebTestAnonymous):
     def tearDown(self):
         WebTestAnonymous.tearDown(self)
         self.app.get('/logout')
-
-
-class DatabaseWithSurvivorCohortTest(unittest.TestCase):
-
-    def acquireDBHandles(self):
-        project = 'enwiki'
-        self.session = db.get_session()
-        engine = db.get_mw_engine(project)
-        db.MediawikiBase.metadata.create_all(engine, checkfirst=True)
-        self.mwSession = db.get_mw_session(project)
-        self.survivors_namespace = 0
-
-    def clearWikimetrics(self):
-        self.session.query(CohortWikiUser).delete()
-        self.session.query(CohortUser).delete()
-        self.session.query(WikiUser).delete()
-        self.session.query(Cohort).delete()
-        self.session.query(User).delete()
-        self.session.query(PersistentReport).delete()
-        self.session.commit()
-        self.session.close()
-
-    def clearMediawiki(self):
-        self.mwSession.query(Logging).delete()
-        self.mwSession.query(Revision).delete()
-        self.mwSession.query(MediawikiUser).delete()
-        self.mwSession.query(Page).delete()
-        self.mwSession.commit()
-        self.mwSession.close()
-
-    def createUsers(self):
-        mw_user_dan = MediawikiUser(user_name='Dan')
-        mw_user_evan = MediawikiUser(user_name='Evan')
-        mw_user_andrew = MediawikiUser(user_name='Andrew')
-        mw_user_diederik = MediawikiUser(user_name='Diederik')
-        self.mwSession.add_all([mw_user_dan, mw_user_evan,
-                               mw_user_andrew, mw_user_diederik])
-        self.mwSession.commit()
-
-        wu_dan = WikiUser(mediawiki_username='Dan', valid=True,
-                          mediawiki_userid=mw_user_dan.user_id, project='enwiki')
-        wu_evan = WikiUser(mediawiki_username='Evan', valid=True,
-                           mediawiki_userid=mw_user_evan.user_id, project='enwiki')
-        wu_andrew = WikiUser(mediawiki_username='Andrew', valid=True,
-                             mediawiki_userid=mw_user_andrew.user_id, project='enwiki')
-        wu_diederik = WikiUser(mediawiki_username='Diederik', valid=True,
-                               mediawiki_userid=mw_user_diederik.user_id,
-                               project='enwiki')
-        self.session.add_all([wu_dan, wu_evan, wu_andrew, wu_diederik])
-        self.session.commit()
-
-        self.dan_id = wu_dan.id
-        self.evan_id = wu_evan.id
-        self.andrew_id = wu_andrew.id
-        self.diederik_id = wu_diederik.id
-
-        self.mw_dan_id = mw_user_dan.user_id
-        self.mw_evan_id = mw_user_evan.user_id
-        self.mw_andrew_id = mw_user_andrew.user_id
-        self.mw_diederik_id = mw_user_diederik.user_id
-
-    def createCohort(self):
-        self.cohort = Cohort(
-            name='demo-survivor-cohort',
-            enabled=True,
-            public=True,
-            validated=True,
-            validate_as_user_ids=True,
-        )
-        self.session.add(self.cohort)
-        self.session.commit()
-
-        ids = [self.dan_id, self.evan_id, self.andrew_id, self.diederik_id]
-        for wiki_editor_id in ids:
-            cohort_wiki_editor = CohortWikiUser(
-                cohort_id=self.cohort.id,
-                wiki_user_id=wiki_editor_id,
-            )
-            self.session.add(cohort_wiki_editor)
-            self.session.commit()
-
-    # update dan,evan,andrew,diederik user_registration timestamp
-    def updateSurvivorRegistrationData(self):
-        registration_date_dan    = format_date(datetime(2013, 1, 1))
-        registration_date_evan   = format_date(datetime(2013, 1, 2))
-        registration_date_andrew = format_date(datetime(2013, 1, 3))
-
-        self.mwSession.query(MediawikiUser) \
-            .filter(MediawikiUser.user_id == self.mw_dan_id) \
-            .update({"user_registration": registration_date_dan})
-
-        self.mwSession.query(MediawikiUser) \
-            .filter(MediawikiUser.user_id == self.mw_evan_id) \
-            .update({"user_registration": registration_date_evan})
-
-        self.mwSession.query(MediawikiUser) \
-            .filter(MediawikiUser.user_id == self.mw_andrew_id) \
-            .update({"user_registration": registration_date_andrew})
-
-    def createPageForSurvivors(self):
-        self.page = Page(page_namespace=self.survivors_namespace,
-                         page_title='SurvivorTestPage')
-        self.mwSession.add_all([self.page])
-        self.mwSession.commit()
-
-    def createRevisionsForSurvivors(self):
-
-        # create a revision for user with id uid at time t
-        def createCustomRevision(uid, t):
-            r = Revision(
-                rev_page=self.page.page_id,
-                rev_user=uid,
-                rev_comment='Survivor Revision',
-                rev_parent_id=111,
-                rev_len=100,
-                rev_timestamp=format_date(t)
-            )
-            self.mwSession.add(r)
-            self.mwSession.commit()
-
-        createCustomRevision(self.mw_dan_id, datetime(2013, 1, 1))
-        createCustomRevision(self.mw_dan_id, datetime(2013, 1, 2))
-        createCustomRevision(self.mw_dan_id, datetime(2013, 1, 3))
-
-        createCustomRevision(self.mw_evan_id, datetime(2013, 1, 2))
-        createCustomRevision(self.mw_evan_id, datetime(2013, 1, 3))
-        createCustomRevision(self.mw_evan_id, datetime(2013, 1, 4))
-
-        createCustomRevision(self.mw_andrew_id, datetime(2013, 1, 3))
-        createCustomRevision(self.mw_andrew_id, datetime(2013, 1, 4))
-        createCustomRevision(self.mw_andrew_id, datetime(2013, 1, 5))
-        createCustomRevision(self.mw_andrew_id, datetime(2013, 1, 6))
-
-    def setUp(self):
-        self.acquireDBHandles()
-        self.clearWikimetrics()
-        self.clearMediawiki()
-        self.createUsers()
-        self.createCohort()
-        self.updateSurvivorRegistrationData()
-        self.createPageForSurvivors()
-        self.createRevisionsForSurvivors()
-
-    def runTest(self):
-        pass

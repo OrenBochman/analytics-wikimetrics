@@ -12,5 +12,15 @@
 .coverage
 .idea
 
+/.tox
+
+
 # never commit this as it holds any server-specific settings like secret keys and passwords, etc.
 config_secret.py
+
+# generated files that are served publicly
+/wikimetrics/static/public
+
+# generic generated files
+/generated/*
+!/generated/README.md

@@ -1,17 +1,14 @@
-from wikimetrics.metrics import Metric
 import datetime
 import calendar
 from sqlalchemy import func, case, Integer
 from sqlalchemy.sql.expression import label, between, and_, or_
-
-from wikimetrics.models import Page, Revision, MediawikiUser
-from wikimetrics.utils import thirty_days_ago, today, CENSORED
-from form_fields import CommaSeparatedIntegerListField, BetterDateTimeField
 from wtforms.validators import Required
 from wtforms import BooleanField, IntegerField
 
-
-__all__ = ['Survival']
+from wikimetrics.utils import thirty_days_ago, today, CENSORED
+from wikimetrics.models import Page, Revision, MediawikiUser
+from wikimetrics.forms.fields import CommaSeparatedIntegerListField, BetterDateTimeField
+from metric import Metric
 
 
 class Survival(Metric):
@@ -55,6 +52,7 @@ class Survival(Metric):
     show_in_ui  = True
     id          = 'survived'
     label       = 'Survival'
+    category    = 'Community'
     description = (
         'Compute whether editors "survived" by making <number_of_edits> from \
         <registration> + <survival_hours> to \
@@ -62,6 +60,10 @@ class Survival(Metric):
         If sunset_in_hours is 0, look for edits from \
         <registration> + <survival_hours> to <today>.'
     )
+    default_result = {
+        'survived': None,
+        CENSORED: None,
+    }
     
     number_of_edits = IntegerField(default=1)
     survival_hours  = IntegerField(default=0)
@@ -99,9 +101,10 @@ class Survival(Metric):
             .join(Revision) \
             .join(Page) \
             .group_by(MediawikiUser.user_id) \
-            .filter(MediawikiUser.user_id.in_(user_ids)) \
             .filter(Page.page_namespace.in_(self.namespaces.data))
         
+        revisions = self.filter(revisions, user_ids, column=MediawikiUser.user_id)
+
         # sunset_in_hours is zero, so we use the first case [T+t,today]
         if sunset_in_hours == 0:
             revisions = revisions.filter(
@@ -136,9 +139,9 @@ class Survival(Metric):
                 func.coalesce(revisions.c.rev_count, 0)
             )
         ) \
-            .outerjoin(revisions, MediawikiUser.user_id == revisions.c.user_id) \
-            .filter(MediawikiUser.user_id.in_(user_ids)) \
-            .subquery()
+            .outerjoin(revisions, MediawikiUser.user_id == revisions.c.user_id)
+
+        revs = self.filter(revs, user_ids, MediawikiUser.user_id).subquery()
         
         metric = session.query(
             revs.c.user_id,
@@ -166,11 +169,8 @@ class Survival(Metric):
         }
         
         r = {
-            uid: metric_results.get(uid, {
-                Survival.id : None,
-                CENSORED    : None,
-            })
-            for uid in user_ids
+            uid: metric_results.get(uid, self.default_result)
+            for uid in user_ids or metric_results.keys()
         }
         
         #self.debug_print(r, session, user_ids)

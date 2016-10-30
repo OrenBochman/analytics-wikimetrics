@@ -30,6 +30,24 @@ def support_index():
     return render_template('support.html')
 
 
+@app.route('/policy')
+@is_public
+def policy_index():
+    """
+    Renders a page with privacy policy information
+    """
+    return render_template('privacy_policy_page.html')
+
+
+@app.route('/contact')
+@is_public
+def contact_index():
+    """
+    Renders the contact page
+    """
+    return render_template('contact.html')
+
+
 @app.route('/favicon.ico')
 @is_public
 def favicon():

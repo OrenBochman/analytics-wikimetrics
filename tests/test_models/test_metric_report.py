@@ -19,17 +19,17 @@ class MetricReportTest(DatabaseTest):
             end_date='2013-01-02 00:00:00',
         )
         mr = MetricReport(
-            metric,
+            metric, self.cohort.id,
             [
                 self.editors[0].user_id,
                 self.editors[1].user_id,
                 self.editors[2].user_id,
             ],
-            'enwiki'
+            'wiki'
         )
         
         result = mr.run()
-        assert_equals(result[self.editors[0].user_id]['edits'], 2)
+        assert_equals(result[self.editor(0)]['edits'], 2)
     
     def test_repr(self):
         metric = metric_classes['NamespaceEdits'](
@@ -39,13 +39,13 @@ class MetricReportTest(DatabaseTest):
             end_date='2013-09-01 00:00:00',
         )
         mr = MetricReport(
-            metric,
+            metric, self.cohort.id,
             [
                 self.editors[0].user_id,
                 self.editors[1].user_id,
                 self.editors[2].user_id,
             ],
-            'enwiki'
+            'wiki'
         )
         
         assert_true(str(mr).find('MetricReport') >= 0)

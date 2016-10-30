@@ -1,8 +1,8 @@
 # 101-108, 114, 130-145, 153
-from nose.tools import assert_equals, assert_true
+from nose.tools import assert_equals, assert_true, assert_raises
 from wikimetrics.metrics import metric_classes
 from wikimetrics.models import (
-    Report, ReportNode, ReportLeaf, PersistentReport, MetricReport,
+    Report, ReportNode, ReportLeaf, MetricReport, ReportStore, TaskErrorStore
 )
 from wikimetrics.models import queue_task
 from ..fixtures import QueueDatabaseTest, DatabaseTest
@@ -26,8 +26,8 @@ class ReportTest(QueueDatabaseTest):
             #end_date = '2013-09-01',
         #)
         #children = [
-            #MetricReport(edits_metric, [self.test_mediawiki_user_id], 'enwiki'),
-            #MetricReport(bytes_metric, [self.test_mediawiki_user_id], 'enwiki'),
+            #MetricReport(edits_metric, 0, [self.test_mediawiki_user_id], 'wiki'),
+            #MetricReport(bytes_metric, 0, [self.test_mediawiki_user_id], 'wiki'),
         #]
         #report_node = ReportNode(children=children)
         #results = report_node.run()
@@ -58,12 +58,22 @@ class QueueTaskTest(QueueDatabaseTest):
         fr = FakeReport()
         result = queue_task(fr)
         assert_equals(result, 'hello world')
+
+    def test_queue_task_error(self):
+        def raise_error():
+            raise RuntimeError('message')
+
+        fr = FakeReport(raise_error)
+        assert_raises(RuntimeError, queue_task, fr)
+        te = self.session.query(TaskErrorStore).first()
+        assert_equals(te.task_id, fr.persistent_id)
+        assert_equals(te.message, 'RuntimeError: message')
     
     def test_set_status(self):
         fr = FakeReport()
         fr.set_status('STARTED')
         self.session.commit()
-        pr_started = self.session.query(PersistentReport).get(fr.persistent_id)
+        pr_started = self.session.query(ReportStore).get(fr.persistent_id)
         assert_equals(pr_started.status, 'STARTED')
         assert_equals(pr_started.queue_result_key, None)
     
@@ -71,7 +81,7 @@ class QueueTaskTest(QueueDatabaseTest):
         fr = FakeReport()
         fr.set_status('WORKING', task_id=1)
         self.session.commit()
-        pr_working = self.session.query(PersistentReport).get(fr.persistent_id)
+        pr_working = self.session.query(ReportStore).get(fr.persistent_id)
         assert_equals(pr_working.status, 'WORKING')
         assert_equals(pr_working.queue_result_key, '1')
 
@@ -80,5 +90,14 @@ class FakeReport(Report):
     """
     This just helps with some of the tests above
     """
+    def __init__(self, callback=None):
+        # store param must be True so that the result is retrievable
+        # this param only defaults to True for RunReport
+        super(FakeReport, self).__init__(store=True)
+        self.callback = callback
+
     def run(self):
-        return 'hello world'
+        if self.callback is None:
+            return 'hello world'
+        else:
+            return self.callback()

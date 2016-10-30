@@ -1,28 +1,231 @@
+import time
+from datetime import timedelta, datetime
+from sqlalchemy import func
 from nose.tools import assert_equals, assert_true, raises
+from mock import patch
 from celery.exceptions import SoftTimeLimitExceeded
-from tests.fixtures import QueueDatabaseTest
-from wikimetrics.models import (
-    RunReport, Aggregation, PersistentReport
-)
-from wikimetrics.metrics import TimeseriesChoices, metric_classes
+from celery import states
+
+from tests.fixtures import QueueDatabaseTest, DatabaseTest
+from wikimetrics.api import ReplicationLagService
+from wikimetrics.models import RunReport, ReportStore, WikiUserStore, CohortWikiUserStore
+from wikimetrics.exceptions import InvalidCohort
+from wikimetrics.metrics import metric_classes
+from wikimetrics.utils import stringify, strip_time
+from wikimetrics.enums import Aggregation, TimeseriesChoices
+from wikimetrics.configurables import queue
+from wikimetrics.schedules.daily import recurring_reports
+
+
+def make_pending(report):
+    report.status = 'PENDING'
+
+
+class RunReportClassMethodsTest(DatabaseTest):
+    def tearDown(self):
+        # re-enable the scheduler after these tests
+        queue.conf['CELERYBEAT_SCHEDULE'] = self.save_schedule
+
+    def setUp(self):
+        DatabaseTest.setUp(self)
+
+        # turn off the scheduler for this test
+        self.save_schedule = queue.conf['CELERYBEAT_SCHEDULE']
+        queue.conf['CELERYBEAT_SCHEDULE'] = {}
+
+        self.common_cohort_1()
+        self.uid = self.owner_user_id
+        self.today = strip_time(datetime.today())
+        # NOTE: running with 20 just makes the tests run faster, but any value > 11 works
+        self.no_more_than = 20
+        self.missed_by_index = {
+            0: [1, 2, 11],
+            1: [1, 2, 11, self.no_more_than + 1, self.no_more_than + 3],
+            2: [1, 2],
+            3: range(0, self.no_more_than + 10),
+        }
+        self.ago_by_index = {
+            0: 26,
+            1: self.no_more_than + 10,
+            2: 6,
+            3: self.no_more_than + 10
+        }
+        age = {
+            i: self.today - timedelta(days=v - 1)
+            for i, v in self.ago_by_index.items()
+        }
+
+        self.p = {
+            'metric': {
+                'start_date': age[0], 'end_date': self.today, 'name': 'NamespaceEdits',
+            },
+            'recurrent': True,
+            'cohort': {'id': self.cohort.id, 'name': self.cohort.name},
+            'name': 'test-recurrent-reports',
+        }
+        ps = stringify(self.p)
+
+        self.reports = [
+            ReportStore(recurrent=True, created=age[0], parameters=ps, user_id=self.uid),
+            ReportStore(recurrent=True, created=age[1], parameters=ps, user_id=self.uid),
+            ReportStore(recurrent=True, created=age[2], parameters=ps, user_id=self.uid),
+            ReportStore(recurrent=True, created=age[3], parameters=ps, user_id=self.uid),
+        ]
+        self.session.add_all(self.reports)
+        self.session.commit()
+
+    def add_runs_to_report(self, index):
+        p = self.p
+        self.report_runs = []
+        for d in range(0, self.no_more_than + 10):
+            day = self.today - timedelta(days=d)
+            p['metric']['start_date'] = day - timedelta(days=1)
+            p['metric']['end_date'] = day
+            p['recurrent'] = False
+            ps = stringify(p)
+            if d not in (self.missed_by_index[index]) and d < self.ago_by_index[index]:
+                self.report_runs.append(ReportStore(
+                    recurrent_parent_id=self.reports[index].id,
+                    created=day,
+                    status='SUCCESS',
+                    parameters=ps,
+                    user_id=self.uid,
+                ))
+
+        self.session.add_all(self.report_runs)
+        self.session.commit()
+
+    def test_days_missed_0(self):
+        self.add_runs_to_report(0)
+        missed_days = RunReport.days_missed(self.reports[0], self.session)
+        assert_equals(set(missed_days), set([
+            self.today - timedelta(days=m)
+            for m in self.missed_by_index[0]
+        ]))
+
+    def test_days_missed_1(self):
+        self.add_runs_to_report(1)
+        missed_days = RunReport.days_missed(self.reports[1], self.session)
+        assert_equals(set(missed_days), set([
+            self.today - timedelta(days=m)
+            for m in self.missed_by_index[1]
+        ]))
+
+    def test_days_missed_2(self):
+        self.add_runs_to_report(2)
+        missed_days = RunReport.days_missed(self.reports[2], self.session)
+        assert_equals(set(missed_days), set([
+            self.today - timedelta(days=m)
+            for m in self.missed_by_index[2]
+        ]))
+
+    def test_days_missed_0_with_cleanup(self):
+        self.add_runs_to_report(0)
+
+        # change some reports back to pending to make sure they're cleaned up
+        map(make_pending, self.report_runs[0::2])
+        self.session.commit()
+
+        missed_days = RunReport.days_missed(self.reports[0], self.session)
+        assert_equals(set(missed_days), set([
+            self.today - timedelta(days=m)
+            for m in self.missed_by_index[0]
+        ] + [r.created for r in self.report_runs[0::2]]))
+
+    def test_days_missed_1_with_cleanup(self):
+        self.add_runs_to_report(1)
+
+        # change some reports back to pending to make sure they're cleaned up
+        map(make_pending, self.report_runs[0::2])
+        self.session.commit()
+
+        missed_days = RunReport.days_missed(self.reports[1], self.session)
+        assert_equals(set(missed_days), set([
+            self.today - timedelta(days=m)
+            for m in self.missed_by_index[1]
+        ] + [r.created for r in self.report_runs[0::2]]))
+
+    def test_days_missed_2_with_cleanup(self):
+        self.add_runs_to_report(2)
+
+        # change some reports back to pending to make sure they're cleaned up
+        map(make_pending, self.report_runs[0::2])
+        self.session.commit()
+
+        missed_days = RunReport.days_missed(self.reports[2], self.session)
+        assert_equals(set(missed_days), set([
+            self.today - timedelta(days=m)
+            for m in self.missed_by_index[2]
+        ] + [r.created for r in self.report_runs[0::2]]))
+
+    def test_create_reports_for_missed_days_0(self):
+        self.add_runs_to_report(0)
+        new_runs = list(RunReport.create_reports_for_missed_days(
+            self.reports[0], self.session, no_more_than=self.no_more_than
+        ))
+        assert_equals(set([r.created for r in new_runs]), set([
+            self.today - timedelta(days=m)
+            for m in self.missed_by_index[0]
+        ]))
+
+    def test_create_reports_for_missed_days_1(self):
+        self.add_runs_to_report(1)
+        new_runs = list(RunReport.create_reports_for_missed_days(
+            self.reports[1], self.session, no_more_than=self.no_more_than
+        ))
+        assert_equals(set([r.created for r in new_runs]), set([
+            self.today - timedelta(days=m)
+            for m in self.missed_by_index[1]
+        ]))
+
+    def test_create_reports_for_missed_days_2(self):
+        self.add_runs_to_report(2)
+        new_runs = list(RunReport.create_reports_for_missed_days(
+            self.reports[2], self.session, no_more_than=self.no_more_than
+        ))
+        assert_equals(set([r.created for r in new_runs]), set([
+            self.today - timedelta(days=m)
+            for m in self.missed_by_index[2]
+        ]))
+
+    def test_create_reports_for_missed_days_3(self):
+        self.add_runs_to_report(3)
+        new_runs = list(RunReport.create_reports_for_missed_days(
+            self.reports[3], self.session, no_more_than=self.no_more_than
+        ))
+        assert_equals(len(new_runs), self.no_more_than)
+
+    def test_rerun(self):
+        def count_report_stores():
+            return len(self.session.query(ReportStore).all())
+
+        prev_report_count = count_report_stores()
+        result = RunReport.rerun(self.reports[0]).get()
+        assert_equals(type(result), dict)
+        next_report_count = count_report_stores()
+        assert_equals(prev_report_count, next_report_count)
 
 
 class RunReportTest(QueueDatabaseTest):
     def setUp(self):
         QueueDatabaseTest.setUp(self)
         self.common_cohort_1()
-    
+
+    @raises(Exception)
     def test_empty_response(self):
-        # TODO: handle case where user tries to submit form with no cohorts / metrics
-        jr = RunReport([], user_id=self.owner_user_id)
-        result = jr.task.delay(jr).get()
-        assert_equals(result, [])
-    
+        """
+        Case where user tries to submit form with no cohorts / metrics
+        should be handled client side server side an exception will be
+        thrown if RunReport object cannot be created
+        """
+        RunReport({}, user_id=self.owner_user_id)
+
     def test_basic_response(self):
-        desired_responses = [{
+        parameters = {
             'name': 'Edits - test',
             'cohort': {
                 'id': self.cohort.id,
+                'name': self.cohort.name,
             },
             'metric': {
                 'name': 'NamespaceEdits',
@@ -35,33 +238,33 @@ class RunReportTest(QueueDatabaseTest):
                 'aggregateAverage': False,
                 'aggregateStandardDeviation': False,
             },
-        }]
-        jr = RunReport(desired_responses, user_id=self.owner_user_id)
+        }
+        jr = RunReport(parameters, user_id=self.owner_user_id)
         results = jr.task.delay(jr).get()
         self.session.commit()
-        result_key = self.session.query(PersistentReport)\
-            .filter(PersistentReport.id == jr.children[0].persistent_id)\
-            .one()\
+        result_key = self.session.query(ReportStore) \
+            .get(jr.persistent_id) \
             .result_key
         results = results[result_key]
         # TODO: figure out why one of the resulting wiki_user_ids is None here
         assert_equals(
-            results[Aggregation.IND][0][self.editors[0].user_id]['edits'],
+            results[Aggregation.IND][self.editor(0)]['edits'],
             2,
         )
-    
-    def test_does_not_run_invalid_cohort_for_any_metric(self):
+
+    def test_raises_invalid_cohort_for_any_metric(self):
         self.cohort.validated = False
         self.session.commit()
-        
+
         for name, metric in metric_classes.iteritems():
             if not metric.show_in_ui:
                 continue
-            
-            desired_responses = [{
+
+            parameters = {
                 'name': '{0} - test'.format(name),
                 'cohort': {
                     'id': self.cohort.id,
+                    'name': self.cohort.name,
                 },
                 'metric': {
                     'name': name,
@@ -74,20 +277,36 @@ class RunReportTest(QueueDatabaseTest):
                     'aggregateAverage': False,
                     'aggregateStandardDeviation': False,
                 },
-            }]
-            jr = RunReport(desired_responses, user_id=self.owner_user_id)
-            celery_task = jr.task.delay(jr)
-            results = celery_task.get()
-            assert_true(
-                results['FAILURE'].find('ran with invalid cohort') >= 0,
-                '{0} ran with invalid cohort'.format(name)
+            }
+            try:
+                RunReport(parameters, user_id=self.owner_user_id)
+            except InvalidCohort:
+                continue
+            assert_true(False)
+
+    def test_wiki_cohort_runs(self):
+        self.create_wiki_cohort()
+        # give the WikiCohort all the users of self.cohort, for easy testing
+        self.session.execute(
+            WikiUserStore.__table__.update().values(
+                validating_cohort=self.basic_wiki_cohort.id
+            ).where(
+                WikiUserStore.validating_cohort == self.cohort.id
             )
-    
-    def test_aggregated_response_namespace_edits(self):
-        desired_responses = [{
+        )
+        self.session.execute(
+            CohortWikiUserStore.__table__.update().values(
+                cohort_id=self.basic_wiki_cohort.id
+            ).where(
+                CohortWikiUserStore.cohort_id == self.cohort.id
+            )
+        )
+        self.cohort = self.basic_wiki_cohort
+        parameters = {
             'name': 'Edits - test',
             'cohort': {
                 'id': self.cohort.id,
+                'name': self.cohort.name,
             },
             'metric': {
                 'name': 'NamespaceEdits',
@@ -100,30 +319,66 @@ class RunReportTest(QueueDatabaseTest):
                 'aggregateAverage': False,
                 'aggregateStandardDeviation': False,
             },
-        }]
-        jr = RunReport(desired_responses, user_id=self.owner_user_id)
+        }
+        jr = RunReport(parameters, user_id=self.owner_user_id)
         results = jr.task.delay(jr).get()
         self.session.commit()
-        result_key = self.session.query(PersistentReport)\
-            .filter(PersistentReport.id == jr.children[0].persistent_id)\
-            .one()\
+        result_key = self.session.query(ReportStore) \
+            .get(jr.persistent_id) \
             .result_key
         results = results[result_key]
         assert_equals(
-            results[Aggregation.IND][0][self.editors[0].user_id]['edits'],
+            results[Aggregation.IND][self.editor(0)]['edits'],
             2,
         )
-        
+
         assert_equals(
             results[Aggregation.SUM]['edits'],
             4,
         )
-    
-    def test_aggregated_response_namespace_edits_with_timeseries(self):
-        desired_responses = [{
+
+    def test_aggregated_response_namespace_edits(self):
+        parameters = {
             'name': 'Edits - test',
             'cohort': {
                 'id': self.cohort.id,
+                'name': self.cohort.name,
+            },
+            'metric': {
+                'name': 'NamespaceEdits',
+                'namespaces': [0, 1, 2],
+                'start_date': '2013-01-01 00:00:00',
+                'end_date': '2013-01-02 00:00:00',
+                'individualResults': True,
+                'aggregateResults': True,
+                'aggregateSum': True,
+                'aggregateAverage': False,
+                'aggregateStandardDeviation': False,
+            },
+        }
+        jr = RunReport(parameters, user_id=self.owner_user_id)
+        results = jr.task.delay(jr).get()
+        self.session.commit()
+        result_key = self.session.query(ReportStore) \
+            .get(jr.persistent_id) \
+            .result_key
+        results = results[result_key]
+        assert_equals(
+            results[Aggregation.IND][self.editor(0)]['edits'],
+            2,
+        )
+
+        assert_equals(
+            results[Aggregation.SUM]['edits'],
+            4,
+        )
+
+    def test_aggregated_response_namespace_edits_with_timeseries(self):
+        parameters = {
+            'name': 'Edits - test',
+            'cohort': {
+                'id': self.cohort.id,
+                'name': self.cohort.name,
             },
             'metric': {
                 'name': 'NamespaceEdits',
@@ -137,25 +392,23 @@ class RunReportTest(QueueDatabaseTest):
                 'aggregateAverage': False,
                 'aggregateStandardDeviation': False,
             },
-        }]
-        jr = RunReport(desired_responses, user_id=self.owner_user_id)
+        }
+        jr = RunReport(parameters, user_id=self.owner_user_id)
         results = jr.task.delay(jr).get()
         self.session.commit()
-        result_key = self.session.query(PersistentReport)\
-            .filter(PersistentReport.id == jr.children[0].persistent_id)\
-            .one()\
+        result_key = self.session.query(ReportStore) \
+            .get(jr.persistent_id) \
             .result_key
         results = results[result_key]
-        
-        user_id = self.editors[0].user_id
-        key = results[Aggregation.IND][0][user_id]['edits'].items()[0][0]
+
+        key = results[Aggregation.IND][self.editor(0)]['edits'].items()[0][0]
         assert_equals(key, '2013-01-01 00:20:00')
-        
+
         assert_equals(
             results[Aggregation.SUM]['edits'].items()[0][0],
             '2013-01-01 00:20:00',
         )
-        
+
         assert_equals(
             results[Aggregation.SUM]['edits']['2013-01-01 00:20:00'],
             8,
@@ -164,30 +417,66 @@ class RunReportTest(QueueDatabaseTest):
             results[Aggregation.SUM]['edits']['2013-02-01 00:00:00'],
             2,
         )
-    
+
     # TODO: This is weird, the exception seems to be thrown
     # But the line is still showing as not covered by tests
-    @raises(Exception)
     def test_invalid_metric(self):
-        run_report = RunReport()
-        run_report.parse_request([{
+        jr = RunReport({
             'name': 'Edits - test',
             'cohort': {
                 'id': self.cohort.id,
             },
             'metric': {
                 'name': 'NamespaceEdits',
-                'namespaces': 'blah blah',
+                'start_date': 'blah',
             },
-        }])
-    
+        }, user_id=self.owner_user_id)
+
+        results = jr.task.delay(jr).get()
+        print results
+        self.session.commit()
+        result_key = self.session.query(ReportStore) \
+            .get(jr.persistent_id) \
+            .result_key
+        assert_true(
+            results[result_key]['FAILURE'].find('Edits was incorrectly configured') >= 0,
+        )
+
+
+class RunReportBasicTest(DatabaseTest):
+    def setUp(self):
+        DatabaseTest.setUp(self)
+        self.common_cohort_1()
+
+    @raises(KeyError)
+    def test_invalid_report(self):
+        RunReport({})
+
     def test_run_report_finish(self):
-        run_report = RunReport([])
-        result = run_report.finish([])
-        assert_equals(result[run_report.result_key], 'Finished')
-    
+        run_report = RunReport({
+            'name': 'Edits - test',
+            'cohort': {
+                'id': self.cohort.id,
+                'name': self.cohort.name,
+            },
+            'metric': {
+                'name': 'NamespaceEdits',
+            },
+        }, user_id=self.owner_user_id)
+        result = run_report.finish(['aggregate_result'])
+        assert_equals(result[run_report.result_key], 'aggregate_result')
+
     def test_run_report_repr(self):
-        run_report = RunReport([])
+        run_report = RunReport({
+            'name': 'Edits - test',
+            'cohort': {
+                'id': self.cohort.id,
+                'name': self.cohort.name,
+            },
+            'metric': {
+                'name': 'NamespaceEdits',
+            },
+        }, user_id=self.owner_user_id)
         assert_true(str(run_report).find('RunReport') >= 0)
 
 
@@ -195,12 +484,13 @@ class RunReportBytesTest(QueueDatabaseTest):
     def setUp(self):
         QueueDatabaseTest.setUp(self)
         self.common_cohort_2()
-    
+
     def test_aggregated_response_bytes_added(self):
-        desired_responses = [{
+        parameters = {
             'name': 'Edits - test',
             'cohort': {
                 'id': self.cohort.id,
+                'name': self.cohort.name,
             },
             'metric': {
                 'name': 'BytesAdded',
@@ -213,32 +503,32 @@ class RunReportBytesTest(QueueDatabaseTest):
                 'aggregateAverage': False,
                 'aggregateStandardDeviation': False,
             },
-        }]
-        jr = RunReport(desired_responses, user_id=self.owner_user_id)
+        }
+        jr = RunReport(parameters, user_id=self.owner_user_id)
         results = jr.task.delay(jr).get()
         self.session.commit()
-        result_key = self.session.query(PersistentReport)\
-            .filter(PersistentReport.id == jr.children[0].persistent_id)\
-            .one()\
+        result_key = self.session.query(ReportStore) \
+            .get(jr.persistent_id) \
             .result_key
         results = results[result_key]
         assert_equals(
-            results[Aggregation.IND][0][self.editors[0].user_id]['net_sum'],
+            results[Aggregation.IND][self.editor(0)]['net_sum'],
             -90,
         )
-        
+
         assert_equals(
             results[Aggregation.SUM]['positive_only_sum'],
             140,
         )
-    
+
     # TODO: figure out how to write this test properly,
     # basically: how to make sure that the queue can be hamerred with requests
     def test_lots_of_concurrent_requests(self):
-        desired_responses = [{
+        parameters = {
             'name': 'Edits - test',
             'cohort': {
                 'id': self.cohort.id,
+                'name': self.cohort.name,
             },
             'metric': {
                 'name': 'BytesAdded',
@@ -251,23 +541,22 @@ class RunReportBytesTest(QueueDatabaseTest):
                 'aggregateAverage': False,
                 'aggregateStandardDeviation': False,
             },
-        }]
+        }
         reports = []
         # NOTE: you can make this loop as much as you'd like if celery
         # is allowed enough concurrent workers, set via CELERYD_CONCURRENCY
         trials = 3
         for i in range(trials):
-            jr = RunReport(desired_responses, user_id=self.owner_user_id)
+            jr = RunReport(parameters, user_id=self.owner_user_id)
             reports.append((jr, jr.task.delay(jr)))
-        
+
         successes = 0
         for jr, delayed in reports:
             try:
                 results = delayed.get()
                 self.session.commit()
-                result_key = self.session.query(PersistentReport)\
-                    .filter(PersistentReport.id == jr.children[0].persistent_id)\
-                    .one()\
+                result_key = self.session.query(ReportStore) \
+                    .get(jr.persistent_id) \
                     .result_key
                 results = results[result_key]
                 if results[Aggregation.SUM]['positive_only_sum'] == 140:
@@ -277,6 +566,91 @@ class RunReportBytesTest(QueueDatabaseTest):
             except Exception:
                 print('An exception occurred during this task.')
                 raise
-        
+
         print('Successes: {0}'.format(successes))
         assert_true(successes == trials, 'all of the trials must succeed')
+
+
+class RunReportScheduledTest(QueueDatabaseTest):
+    def setUp(self):
+        QueueDatabaseTest.setUp(self)
+        self.common_cohort_1()
+
+    def inject_and_fetch_recurrent_run(self):
+        parameters = {
+            'name': 'Edits - test',
+            'cohort': {
+                'id': self.cohort.id,
+                'name': self.cohort.name,
+            },
+            'metric': {
+                'name': 'NamespaceEdits',
+                'namespaces': [0, 1, 2],
+                'start_date': '2013-01-01 00:00:00',
+                'end_date': '2013-01-03 00:00:00',
+                'individualResults': True,
+                'aggregateResults': False,
+                'aggregateSum': False,
+                'aggregateAverage': False,
+                'aggregateStandardDeviation': False,
+            },
+            'recurrent': True,
+        }
+
+        jr = RunReport(parameters, user_id=self.owner_user_id)
+        jr.task.delay(jr).get()
+        self.session.commit()
+
+        # executing directly the code that will be run by the scheduler
+        recurring_reports()
+        recurrent_runs = self.session.query(ReportStore) \
+            .filter(ReportStore.recurrent_parent_id == jr.persistent_id) \
+            .all()
+
+        return recurrent_runs
+
+    @patch.object(ReplicationLagService, 'is_any_lagged', return_value=False)
+    def test_scheduler_without_lag(self, is_any_lagged_mock):
+        recurrent_runs = self.inject_and_fetch_recurrent_run()
+
+        # make sure we have one and no more than one recurrent run
+        assert_equals(len(recurrent_runs), 1)
+
+    @patch.object(ReplicationLagService, 'is_any_lagged', return_value=True)
+    def test_scheduler_with_lag(self, is_any_lagged_mock):
+        recurrent_runs = self.inject_and_fetch_recurrent_run()
+
+        # make sure we no recurrent run has been scheduled
+        assert_equals(len(recurrent_runs), 0)
+
+    def test_user_id_assigned_properly(self):
+        parameters = {
+            'name': 'Bytes - test',
+            'cohort': {
+                'id': self.cohort.id,
+                'name': self.cohort.name,
+            },
+            'metric': {
+                'name': 'BytesAdded',
+                'namespaces': '0,1,2',
+                'start_date': '2013-01-01 00:00:00',
+                'end_date': '2013-01-02 00:00:00',
+                'individualResults': True,
+                'aggregateResults': True,
+                'aggregateSum': True,
+                'aggregateAverage': False,
+                'aggregateStandardDeviation': False,
+            },
+        }
+
+        jr = RunReport(parameters, user_id=self.owner_user_id)
+        jr.task.delay(jr).get()
+        self.session.commit()
+        # executing directly the code that will be run by the scheduler
+        recurring_reports()
+
+        # make sure all report nodes have a user_id
+        no_user_id = self.session.query(func.count(ReportStore)) \
+            .filter(ReportStore.user_id == None) \
+            .one()[0]
+        assert_equals(no_user_id, 0)

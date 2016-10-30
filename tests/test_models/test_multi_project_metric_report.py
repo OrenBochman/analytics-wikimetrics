@@ -1,7 +1,7 @@
 from nose.tools import assert_equals, assert_true
 from wikimetrics.metrics import metric_classes
 from wikimetrics.models import (
-    MultiProjectMetricReport, PersistentReport, Cohort,
+    MultiProjectMetricReport,
 )
 from ..fixtures import QueueDatabaseTest, DatabaseTest
 
@@ -22,13 +22,7 @@ class MultiProjectMetricReportTest(QueueDatabaseTest):
         
         result = mr.task.delay(mr).get()
         
-        self.session.commit()
-        result_key = self.session.query(PersistentReport)\
-            .filter(PersistentReport.id == mr.persistent_id)\
-            .one()\
-            .result_key
-        
-        assert_equals(result[result_key][self.editors[0].user_id]['edits'], 2)
+        assert_equals(result[self.editor(0)]['edits'], 2)
 
 
 class MultiProjectMetricReportWithoutQueueTest(DatabaseTest):
@@ -54,8 +48,8 @@ class MultiProjectMetricReportWithoutQueueTest(DatabaseTest):
             }
         ])
         
-        assert_equals(finished[mr.result_key][1]['edits'], 2)
-        assert_equals(finished[mr.result_key][2]['edits'], 3)
+        assert_equals(finished[1]['edits'], 2)
+        assert_equals(finished[2]['edits'], 3)
     
     def test_repr(self):
         metric = metric_classes['NamespaceEdits'](

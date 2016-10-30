@@ -1,9 +1,11 @@
 body { padding-top: 60px; padding-bottom: 60px; }
 table caption { padding: 16px; }
-.navbar-fixed-top .nav { width: 80%; }
+.highlight { background-color: #fad435; color: #000; }
+.navbar-fixed-top .nav { width: 85%; }
 .navbar-fixed-top .nav li:last-child { color: #cacaca; float: right !important; }
 .navbar-fixed-top .nav li:last-child a { color: #0088cc; display: inline-block; }
 label.error { color: #af3333; }
+span.label{font-weight:normal !important;}
 div.flash { margin: 4px 0 20px 0; }
 
 
@@ -40,8 +42,7 @@ a.openid-logo.twitter {
 
 
 /* creating a new report */
-div.pick-cohorts .navbar-search { margin: 16px 0 0 0; }
-div.pick-cohorts .cohorts { margin: 14px 0 0 14px; max-height: 160px; overflow-x: hidden; overflow-y: auto; }
+div.pick-cohorts .cohorts { margin: 4px 0 0 14px; max-height: 160px; overflow-x: hidden; overflow-y: auto; }
 div.pick-metrics, .sample-result { background-color: #fff; }
 div.pick-metrics .tabbable, .sample-result .tabbable { margin: 22px 0 0 0; }
 td.blur-completely { text-shadow: 0 0 20px rgba(0,0,0,0.6); color: transparent; }
@@ -55,3 +56,63 @@ table.sample-results tbody.totals td {
 
 /* uploading a cohort */
 form.upload-cohort div.navbar-inner { margin: 0 0 20px 0; }
+
+/** icons from sprite **/
+
+.icon{
+        background:  url(/static/img/sprite-icons.png); no-repeat;
+}
+
+.unlocked{
+        background-position: -22px 0;
+        width: 18px;
+        height: 19px;
+}
+
+.recurrent{
+        background-position: 0 -24px ;
+        width: 20px;
+        height: 17px;
+}
+
+.locked{
+        background-position: -2px 0;
+        width: 18px;
+        height: 19px;
+}
+
+.check{
+        background-position: -25px -23px ;
+        width: 18px;
+        height: 16px;
+}
+
+.icon.align-with-btn { margin: 4px 13px; }
+
+/* form field stuff */
+.disabled-field { display: none; }
+
+p.validated-users { font-size: medium }
+
+/* cohort membership */
+.btn.narrow {
+    height: 10px;
+    line-height: 10px;
+    font-size: 12px;
+}
+
+/* report list */
+.btn-medium-width {
+    width: 100px;
+}
+
+select {
+    margin: 0;
+}
+
+span.textarea-label {
+    display: inline-block;
+    width: 30%;
+    vertical-align: bottom;
+    margin: 0 12px 0 12px;
+}

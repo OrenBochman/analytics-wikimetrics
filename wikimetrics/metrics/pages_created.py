@@ -1,12 +1,11 @@
-from ..utils import thirty_days_ago, today
 from sqlalchemy import func
-from timeseries_metric import TimeseriesMetric
-from form_fields import CommaSeparatedIntegerListField, BetterDateTimeField
+from sqlalchemy.sql.expression import label
 from wtforms.validators import Required
-from wikimetrics.models import Page, Revision
 
-
-__all__ = ['PagesCreated']
+from wikimetrics.utils import thirty_days_ago, today
+from wikimetrics.forms.fields import CommaSeparatedIntegerListField, BetterBooleanField
+from wikimetrics.models import Page, Revision, Archive
+from timeseries_metric import TimeseriesMetric
 
 
 class PagesCreated(TimeseriesMetric):
@@ -29,16 +28,22 @@ class PagesCreated(TimeseriesMetric):
     show_in_ui  = True
     id          = 'pages_created'
     label       = 'Pages Created'
+    category    = 'Content'
     description = (
         'Compute the number of pages created by each \
          editor in a time interval'
     )
-    
+    default_result  = {
+        'pages_created': 0,
+    }
+
+    include_deleted = BetterBooleanField(
+        default=True,
+        description='Count pages that have been deleted',
+    )
     namespaces = CommaSeparatedIntegerListField(
         None,
-        [Required()],
-        default='0',
-        description='0, 2, 4, etc.',
+        description='0, 2, 4, etc. (leave blank for *all*)',
     )
     
     def __call__(self, user_ids, session):
@@ -54,20 +59,46 @@ class PagesCreated(TimeseriesMetric):
         start_date = self.start_date.data
         end_date = self.end_date.data
         
-        pages_by_user = session\
-            .query(Revision.rev_user, func.count(Page.page_id))\
-            .join(Page)\
-            .filter(Page.page_namespace.in_(self.namespaces.data))\
+        revisions = session\
+            .query(
+                label('user_id', Revision.rev_user),
+                label('timestamp', Revision.rev_timestamp)
+            )\
             .filter(Revision.rev_parent_id == 0)\
-            .filter(Revision.rev_user.in_(user_ids))\
             .filter(Revision.rev_timestamp > start_date)\
-            .filter(Revision.rev_timestamp <= end_date)\
-            .group_by(Revision.rev_user)
-        
-        query = self.apply_timeseries(pages_by_user)
+            .filter(Revision.rev_timestamp <= end_date)
+
+        archives = session\
+            .query(
+                label('user_id', Archive.ar_user),
+                label('timestamp', Archive.ar_timestamp)
+            )\
+            .filter(Archive.ar_parent_id == 0)\
+            .filter(Archive.ar_timestamp > start_date)\
+            .filter(Archive.ar_timestamp <= end_date)
+
+        if self.namespaces.data and len(self.namespaces.data) > 0:
+            revisions = revisions.join(Page)\
+                .filter(Page.page_namespace.in_(self.namespaces.data))
+            archives = archives\
+                .filter(Archive.ar_namespace.in_(self.namespaces.data))
+
+        revisions = self.filter(revisions, user_ids, column=Revision.rev_user)
+        archives = self.filter(archives, user_ids, column=Archive.ar_user)
+
+        both = revisions
+        if self.include_deleted.data:
+            both = both.union_all(archives)
+        both = both.subquery()
+
+        query = session.query(both.c.user_id, func.count())\
+            .group_by(both.c.user_id)
+
+        query = self.apply_timeseries(query, column=both.c.timestamp)
+
         return self.results_by_user(
             user_ids,
             query,
-            [('pages_created', 1, 0)],
+            [(self.id, 1, 0)],
             date_index=2,
         )

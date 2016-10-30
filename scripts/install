@@ -1,0 +1,13 @@
+#!/bin/bash
+
+# is it wikimetrics_dir=${$1:-$(pwd)}?
+wikimetrics_dir=${1:-$(pwd)}
+
+cd $wikimetrics_dir
+sudo pip install -e .
+echo "*** installed dependencies"
+
+# make sure you have a recent setuptools and pip
+echo "*** If this fails, the usual suspects are old versions of pip and setuptools.
+          Known Working versions are: pip 1.5.6 and setuptools 9.1"
+

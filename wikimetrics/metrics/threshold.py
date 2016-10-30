@@ -1,18 +1,15 @@
-from wikimetrics.metrics import Metric
 import datetime
 import calendar
 from sqlalchemy import func, case, Integer
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.expression import label, between, and_, or_
-
-from wikimetrics.models import Page, Revision, MediawikiUser
-from wikimetrics.utils import thirty_days_ago, today, CENSORED
-from form_fields import CommaSeparatedIntegerListField, BetterDateTimeField
 from wtforms.validators import Required
 from wtforms import BooleanField, IntegerField
 
-
-__all__ = ['Threshold']
+from wikimetrics.models import Page, Revision, MediawikiUser
+from wikimetrics.utils import thirty_days_ago, today, CENSORED
+from wikimetrics.forms.fields import CommaSeparatedIntegerListField, BetterDateTimeField
+from metric import Metric
 
 
 class Threshold(Metric):
@@ -58,11 +55,17 @@ class Threshold(Metric):
     id                      = 'threshold'
     time_to_threshold_id    = 'time_to_threshold'
     label                   = 'Threshold'
+    category                = 'Community'
     description = (
         'Compute whether editors made <number_of_edits> from \
         <registration> to <registration> + <threshold_hours>.  \
         Also compute the time it took them to reach that threshold, in hours.'
     )
+    default_result = {
+        'threshold': None,
+        'time_to_threshold': None,
+        CENSORED: None,
+    }
     
     number_of_edits = IntegerField(default=1)
     threshold_hours = IntegerField(default=24)
@@ -110,14 +113,13 @@ class Threshold(Metric):
             ) \
             .group_by(Revision.rev_user) \
             .group_by(Revision.rev_timestamp) \
-            .filter(Revision.rev_user.in_(user_ids)) \
             .filter(Page.page_namespace.in_(self.namespaces.data)) \
             .filter(
                 func.unix_timestamp(Revision.rev_timestamp) -
                 func.unix_timestamp(MediawikiUser.user_registration) <= threshold_secs
             )
         
-        o_r = ordered_revisions.subquery()
+        o_r = self.filter(ordered_revisions, user_ids).subquery()
         
         metric = session.query(
             MediawikiUser.user_id,
@@ -150,10 +152,9 @@ class Threshold(Metric):
                 o_r,
                 and_(
                     MediawikiUser.user_id == o_r.c.rev_user,
-                    o_r.c.number == number_of_edits
-                )
-            ) \
-            .filter(MediawikiUser.user_id.in_(user_ids))
+                    o_r.c.number == number_of_edits))
+
+        metric = self.filter(metric, user_ids, MediawikiUser.user_id)
         
         return {
             u.user_id: {

@@ -1,4 +1,8 @@
 import json
+import os
+import os.path
+import collections
+import re
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta, date
 from flask import Response
@@ -11,6 +15,12 @@ MEDIAWIKI_TIMESTAMP = '%Y%m%d%H%M%S'
 PRETTY_TIMESTAMP = '%Y-%m-%d %H:%M:%S'
 # This is used to mean that a result was censored in some way
 CENSORED = 'censored'
+# Used to mean a metric is not returning any results
+NO_RESULTS = 'no-results'
+# Unicode NULL
+UNICODE_NULL = u'\x00'
+
+PUBLIC_REPORT_FILE = '%Y-%m-%d'
 
 
 def parse_date(date_string):
@@ -21,6 +31,14 @@ def format_date(date_object):
     return date_object.strftime(MEDIAWIKI_TIMESTAMP)
 
 
+def format_date_for_public_report_file(date_object):
+    return date_object.strftime(PUBLIC_REPORT_FILE)
+
+
+def parse_date_from_public_report_file(date_string):
+    return datetime.strptime(date_string, PUBLIC_REPORT_FILE).date()
+
+
 def parse_pretty_date(date_string):
     return datetime.strptime(date_string, PRETTY_TIMESTAMP)
 
@@ -29,8 +47,12 @@ def format_pretty_date(date_object):
     return date_object.strftime(PRETTY_TIMESTAMP)
 
 
+def json_string(obj):
+    return json.dumps(obj, cls=BetterEncoder, indent=4, ensure_ascii=False)
+
+
 def stringify(*args, **kwargs):
-    return json.dumps(dict(*args, **kwargs), cls=BetterEncoder, indent=4)
+    return json_string(dict(*args, **kwargs))
 
 
 def json_response(*args, **kwargs):
@@ -42,7 +64,7 @@ def json_response(*args, **kwargs):
         * Decimal objects encoded via BetterEncoder
     """
     data = stringify(*args, **kwargs)
-    return Response(data, mimetype='application/json')
+    return Response(data, content_type='application/json; charset=utf-8')
 
 
 def json_error(message):
@@ -69,17 +91,52 @@ class BetterEncoder(json.JSONEncoder):
     dates properly.  You should make sure your client is happy with this serialization:
         print(json.dumps(obj, cls=BetterEncoder))
     """
-    
+
+    def encode(self, o):
+        """
+        Please see https://hg.python.org/cpython/file/7ec9255d4189/Lib/json/encoder.py
+        we are overriding a "private" method to get rid
+        of encoding errors once and for all
+        when sending json responses
+        """
+        ESCAPE = re.compile(r'[\x00-\x1f\\"\b\f\n\r\t]')
+        ESCAPE_DCT = {
+            '\\': '\\\\',
+            '"': '\\"',
+            '\b': '\\b',
+            '\f': '\\f',
+            '\n': '\\n',
+            '\r': '\\r',
+            '\t': '\\t',
+        }
+
+        def encode_basestring(s):
+            """Return a JSON representation of a Python string"""
+            def replace(match):
+                return ESCAPE_DCT[match.group(0)]
+            return '"' + ESCAPE.sub(replace, s) + '"'
+
+        if isinstance(o, basestring):
+            return encode_basestring(o)
+
+        # This doesn't pass the iterator directly to ''.join() because the
+        # exceptions aren't as detailed.  The list call should be roughly
+        # equivalent to the PySequence_Fast that ''.join() would do.
+        chunks = self.iterencode(o, _one_shot=True)
+
+        if not isinstance(chunks, (list, tuple)):
+            chunks_decoded = [c.decode('utf-8') for c in chunks]
+        return u''.join(chunks_decoded)
+
     def default(self, obj):
         if isinstance(obj, datetime):
             return format_pretty_date(obj)
-        
+
         if isinstance(obj, date):
             return format_pretty_date(obj)
-        
+
         if isinstance(obj, Decimal):
             return float(obj)
-        
         return json.JSONEncoder.default(self, obj)
 
 
@@ -107,9 +164,9 @@ def deduplicate_by_key(list_of_objects, key_function):
     uniques = dict()
     for o in list_of_objects:
         key = key_function(o)
-        if not key in uniques:
+        if key not in uniques:
             uniques[key] = o
-    
+
     return uniques.values()
 
 
@@ -143,8 +200,121 @@ def r(num, places=4):
     return Decimal(num or 0).quantize(Decimal(precision), rounding=ROUND_HALF_UP)
 
 
-class Unauthorized(Exception):
+def diff_datewise(left, right, left_parse=None, right_parse=None):
     """
-    Different exception type to separate "unauthorized" errors from the rest
+    Parameters
+        left        : a list of datetime strings or objects
+        right       : a list of datetime strings or objects
+        left_parse  : if left contains datetimes, None; else a strptime format
+        right_parse : if right contains datetimes, None; else a strptime format
+
+    Returns
+        A tuple of two sets:
+        [0] : the datetime objects in left but not right
+        [1] : the datetime objects in right but not left
     """
-    pass
+
+    if left_parse:
+        left_set = set([
+            datetime.strptime(l.strip(), left_parse)
+            for l in left if len(l.strip())
+        ])
+    else:
+        left_set = set(left)
+
+    if right_parse:
+        right_set = set([
+            datetime.strptime(r.strip(), right_parse)
+            for r in right if len(r.strip())
+        ])
+    else:
+        right_set = set(right)
+
+    return (left_set - right_set, right_set - left_set)
+
+
+def timestamps_to_now(start, increment):
+    """
+    Generates timestamps from @start to datetime.now(), by @increment
+
+    Parameters
+        start       : the first generated timestamp
+        increment   : the timedelta between the generated timestamps
+
+    Returns
+        A generator that goes from @start to datetime.now() - x,
+        where x <= @increment
+    """
+    now = datetime.now()
+    while start < now:
+        yield start
+        start += increment
+
+
+def strip_time(to_strip):
+    """
+    Strips the hours, minutes, and seconds from a datetime instance
+    """
+    return to_datetime(to_strip.date())
+
+
+def to_datetime(d):
+    """
+    Converts a date to a datetime
+    """
+    return datetime.combine(d, datetime.min.time())
+
+
+def parse_username(username):
+    """
+    parses uncapitalized, whitespace-padded, and weird-charactered mediawiki
+    user names into ones that have a chance of being found in the database
+
+    needs to accept either a unicode or string input, returns str of bytes
+    """
+    # not pretty but python 2.7 is a box of
+    # suprises when it comes to str versus unicode types
+    if not isinstance(username, unicode):
+        username = username.decode('utf8', errors='ignore')
+
+    parsed = username.strip()
+    if len(parsed) != 0:
+        parsed = parsed[0].upper() + parsed[1:]
+
+    return parsed.encode('utf8')
+
+
+def parse_tag(tag):
+    parsed_tag = " ".join(tag.lower().split()).replace(" ", "-")
+    return parsed_tag
+
+
+def chunk(array, chunk_size):
+    """
+    Chunk a list into sub-lists
+
+    Parameters
+        array       : a list
+        chunk_size  : max size for each returned sublist
+
+    Returns
+        array chunked up into chunk_size pieces and returned as
+        a generator of those pieces (last piece might be < chunk_size)
+    """
+    for i in xrange(0, len(array), chunk_size):
+        yield array[i : i + chunk_size]
+
+
+def update_dict(target, source):
+    """
+    Updates a target dictionary recursively from a source dictionary
+    """
+    for key, val in source.items():
+        if isinstance(val, collections.Mapping):
+            tmp = target.get(key, {})
+            update_dict(tmp, val)
+            target[key] = tmp
+        elif isinstance(val, list):
+            target[key] = target.get(key, []) + val
+        else:
+            target[key] = source[key]
